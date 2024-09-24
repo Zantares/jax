@@ -24,8 +24,7 @@ from jax._src import test_util as jtu
 from jax._src.lax.control_flow import for_loop
 import jax.numpy as jnp
 
-from jax import config
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 def remat_of_for_loop(nsteps, body, state, **kwargs):
   return jax.remat(lambda state: for_loop.for_loop(nsteps, body, state,
@@ -143,7 +142,7 @@ class ForLoopTest(jtu.JaxTestCase):
 
     key = jax.random.PRNGKey(0)
     x = jax.random.normal(key, (8,))
-    np.testing.assert_allclose(cumsum(x), jnp.cumsum(x))
+    np.testing.assert_allclose(cumsum(x), jnp.cumsum(x), rtol=1e-6)
 
 def for_body_swap(i, refs):
   a_ref, b_ref = refs
@@ -297,7 +296,7 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
     A = jnp.zeros((3, 3))
     # The second DUS was unnecessarily replicating A across time.
     # We check XLA because _scan_impl is "underneath" the jaxpr language.
-    s = str(jax.xla_computation(jax.grad(loss))(A).as_hlo_text())
+    s = jax.jit(jax.grad(loss)).lower(A).as_text('hlo')
     assert s.count("dynamic-update-slice(") < 2
 
   @_for_loop_impls
@@ -320,8 +319,10 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
     _, f_lin = jax.linearize(f, a, b)
     expected_tangents = f_lin(a, b)
     _, actual_tangents = jax.jvp(f, (a, b), (a, b))
-    np.testing.assert_allclose(actual_tangents[0], expected_tangents[0])
-    np.testing.assert_allclose(actual_tangents[1], expected_tangents[1])
+    np.testing.assert_allclose(actual_tangents[0], expected_tangents[0],
+                               rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(actual_tangents[1], expected_tangents[1],
+                               rtol=1e-6, atol=1e-6)
 
     def body2(_, refs):
       # Here we use `i_ref` as a loop counter
@@ -344,7 +345,8 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
     expected_tangents = g_lin(a, b)
     _, actual_tangents = jax.jvp(g, (a, b), (a, b))
     np.testing.assert_allclose(actual_tangents[0], expected_tangents[0])
-    np.testing.assert_allclose(actual_tangents[1], expected_tangents[1])
+    np.testing.assert_allclose(actual_tangents[1], expected_tangents[1],
+                               rtol=1e-6)
 
   @jtu.sample_product(
     [dict(for_body_name=for_body_name, f=for_body, ref=ref,

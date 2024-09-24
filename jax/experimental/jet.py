@@ -45,14 +45,15 @@ r"""Jet is an experimental module for higher-order automatic differentiation
   and can thus be used for high-order
   automatic differentiation of :math:`f`.
   Details are explained in
-  `these notes <https://github.com/google/jax/files/6717197/jet.pdf>`__.
+  `these notes <https://github.com/jax-ml/jax/files/6717197/jet.pdf>`__.
 
   Note:
     Help improve :func:`jet` by contributing
-    `outstanding primitive rules <https://github.com/google/jax/issues/2431>`__.
+    `outstanding primitive rules <https://github.com/jax-ml/jax/issues/2431>`__.
 """
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from functools import partial
 
@@ -490,24 +491,22 @@ def _pow_taylor(primals_in, series_in):
   return primal_out, series_out
 jet_rules[lax.pow_p] = _pow_taylor
 
+def _pow_by_squaring(x, n):
+  if n < 0:
+    return _pow_by_squaring(1 / x, -n)
+  elif n == 0:
+    return 1
+  elif n % 2 == 0:
+    return _pow_by_squaring(x * x, n / 2)
+  elif n % 2 == 1:
+    return x * _pow_by_squaring(x * x, (n - 1) / 2)
+
 def _integer_pow_taylor(primals_in, series_in, *, y):
   if y == 0:
     return jet(jnp.ones_like, primals_in, series_in)
-  elif y == 1:
-    return jet(lambda x: x, primals_in, series_in)
-  elif y == 2:
-    return jet(lambda x: x * x, primals_in, series_in)
-  x, = primals_in
-  series, = series_in
-  u = [x] + series
-  v = [lax.integer_pow(x, y)] + [None] * len(series)
-  for k in range(1, len(v)):
-    vu = sum(_scale(k, j) * v[k-j] * u[j] for j in range(1, k + 1))
-    uv = sum(_scale(k, j) * u[k-j] * v[j] for j in range(1, k))
-    v[k] = jnp.where(x == 0, 0, fact(k-1) * (y * vu - uv) / x)
-  primal_out, *series_out = v
+  else:
+    return jet(lambda x: _pow_by_squaring(x, y), primals_in, series_in)
 
-  return primal_out, series_out
 jet_rules[lax.integer_pow_p] = _integer_pow_taylor
 
 
@@ -718,7 +717,7 @@ def _jet_jaxpr(
 ) -> tuple[core.ClosedJaxpr, Any]:
   f = lu.wrap_init(core.jaxpr_as_fun(jaxpr))
   f_jet, out_tree_def = traceable(jet_fun(jet_subtrace(f), order), in_tree_def)
-  jaxpr_jet, _, consts = pe.trace_to_jaxpr_dynamic(
+  jaxpr_jet, _, consts, () = pe.trace_to_jaxpr_dynamic(
       f_jet, primals_and_series_avals)
   return core.ClosedJaxpr(jaxpr_jet, consts), out_tree_def
 
@@ -741,6 +740,8 @@ def _pjit_jet_rule(primals_in, series_in, **params):
           params['out_shardings']
           + (sharding_impls.UNSPECIFIED,) * num_series_out
       ),
+      'in_layouts': params['in_layouts'] + (None,) * num_series_in,
+      'out_layouts': params['out_layouts'] + (None,) * num_series_out,
       'donated_invars': params['donated_invars'] + (False,) * num_series_in,
   }
   result = pjit.pjit_p.bind(*primals_and_series, **new_params)

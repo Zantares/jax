@@ -44,7 +44,7 @@ def shard_alike(x, y):
       raise ValueError(
           'The leaves shapes of `x` and `y` should match. Got `x` leaf shape:'
           f' {x_aval.shape} and `y` leaf shape: {y_aval.shape}. File an issue at'
-          ' https://github.com/google/jax/issues if you want this feature.')
+          ' https://github.com/jax-ml/jax/issues if you want this feature.')
 
   outs = [shard_alike_p.bind(x_, y_) for x_, y_ in safe_zip(x_flat, y_flat)]
   x_out_flat, y_out_flat = zip(*outs)
@@ -64,9 +64,21 @@ def shard_alike_transpose(ct, **kwargs):
     return shard_alike(x_ct, y_ct)
 ad.deflinear(shard_alike_p, shard_alike_transpose)
 
-def _shard_alike_batcher(vals_in, dims_in):
-  vals_out = shard_alike_p.bind(*vals_in)
-  return vals_out, dims_in
+
+def _shard_alike_batcher(batched_args, batch_dims):
+  x, y = batched_args
+  xd, yd = batch_dims
+  if xd == yd:
+    return shard_alike(x, y), (xd, yd)
+  elif xd is batching.not_mapped:
+    x = batching.broadcast(x, y.shape[yd], yd)
+    return shard_alike(x, y), (yd, yd)
+  elif yd is batching.not_mapped:
+    y = batching.broadcast(y, x.shape[xd], xd)
+    return shard_alike(x, y), (xd, xd)
+  else:
+    y = batching.moveaxis(y, yd, xd)
+    return shard_alike(x, y), (xd, xd)
 batching.primitive_batchers[shard_alike_p] = _shard_alike_batcher
 
 

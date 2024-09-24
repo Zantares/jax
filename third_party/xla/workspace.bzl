@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# buildifier: disable=module-docstring
 load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 
 # To update XLA to a new revision,
@@ -20,8 +21,8 @@ load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 #    curl -L https://github.com/openxla/xla/archive/<git hash>.tar.gz | sha256sum
 #    and update XLA_SHA256 with the result.
 
-XLA_COMMIT = "70ba83748baf84463a1087d725af87ea13d57805"
-XLA_SHA256 = "e87994b91432e9a4be2699fd026c322120ff4628152be119654e904a0ac6fa04"
+XLA_COMMIT = "1162b7e30d12d00aa4d004a71217ef958d8aa290"
+XLA_SHA256 = "706d360fa2f82174fb7210cf7b87470faa2440f7614efc57136f47879d0032ed"
 
 def repo():
     tf_http_archive(

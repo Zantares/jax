@@ -30,7 +30,7 @@ Instead of writing this information as conditions inside one
 particular test, we write them as `Limitation` objects that can be reused in
 multiple tests and can also be used to generate documentation, e.g.,
 the report of [unsupported and partially-implemented JAX
-primitives](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/g3doc/jax_primitives_coverage.md)
+primitives](https://github.com/jax-ml/jax/blob/main/jax/experimental/jax2tf/g3doc/jax_primitives_coverage.md)
 
 The limitations are used to filter out from tests the harnesses that are known
 to fail. A Limitation is specific to a harness.
@@ -38,11 +38,11 @@ to fail. A Limitation is specific to a harness.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 import operator
 import os
 from functools import partial
-from typing import Any, Callable, NamedTuple, Union
+from typing import Any, NamedTuple, Union
 
 from absl import testing
 import numpy as np
@@ -61,6 +61,9 @@ from jax._src.lax import control_flow as lax_control_flow
 from jax._src.lax import windowed_reductions as lax_windowed_reductions
 from jax._src.lib import xla_client
 from jax._src import random as jax_random
+
+# mypy generates a lot of false positive due to re-assigned variables.
+# mypy: disable-error-code="assignment, no-redef"
 
 # The code in this file relies on the values of some flags that are defined by
 # jtu. Note that the following can not always be moved to a test file since
@@ -172,9 +175,9 @@ class Harness:
     self.group_name = jtu.sanitize_test_name(group_name)
     self.name = jtu.sanitize_test_name(name)
     self.fullname = self.name if self.group_name is None else f"{self.group_name}_{self.name}"
-    self.fun = fun  # type: ignore[assignment]
+    self.fun = fun
     self.arg_descriptors = arg_descriptors
-    self.rng_factory = rng_factory  # type: ignore[assignment]
+    self.rng_factory = rng_factory
     self.jax_unimplemented = jax_unimplemented
     self.dtype = dtype
     self.params = params
@@ -502,7 +505,7 @@ def _make_convert_element_type_harness(name,
       "convert_element_type",
       f"{name}_shape={jtu.format_shape_dtype_string(shape, dtype)}_olddtype={jtu.dtype_str(dtype)}_newdtype={jtu.dtype_str(new_dtype)}",
       lambda arg: (lax.convert_element_type_p.bind(
-          arg, new_dtype=np.dtype(new_dtype), weak_type=False)),
+          arg, new_dtype=np.dtype(new_dtype), weak_type=False, sharding=None)),
       [RandArg(shape, dtype)],
       shape=shape,
       dtype=dtype,
@@ -512,7 +515,7 @@ def _make_convert_element_type_harness(name,
 for old_dtype in jtu.dtypes.all:
   # TODO(bchetioui): JAX behaves weirdly when old_dtype corresponds to floating
   # point numbers and new_dtype is an unsigned integer. See issue
-  # https://github.com/google/jax/issues/5082 for details.
+  # https://github.com/jax-ml/jax/issues/5082 for details.
   for new_dtype in (jtu.dtypes.all
                     if not (dtypes.issubdtype(old_dtype, np.floating) or
                             dtypes.issubdtype(old_dtype, np.complexfloating))
@@ -651,7 +654,7 @@ def _make_device_put_harness(name,
   define(
       "device_put",
       f"{name}_shape={jtu.format_shape_dtype_string(shape, dtype)}_{device=}",
-      lambda x: dispatch.device_put_p.bind(x, device=_device_fn(), src=None),
+      lambda x: dispatch.device_put_p.bind(x, devices=[_device_fn()], srcs=[None])[0],
       [RandArg(shape, dtype)],
       shape=shape,
       dtype=dtype,
@@ -702,7 +705,6 @@ for dtype in jtu.dtypes.all:
     _make_bitcast_convert_type_harness(
         "dtypes_to_new_dtypes", dtype=dtype, new_dtype=new_dtype)
 
-
 def _make_add_any_harness(name, *, shapes=((2,), (2,)), dtype=np.float32):
   define(
       ad_util.add_any_p,
@@ -712,9 +714,9 @@ def _make_add_any_harness(name, *, shapes=((2,), (2,)), dtype=np.float32):
       dtype=dtype,
       shapes=shapes)
 
-
 for dtype in set(jtu.dtypes.all) - set(jtu.dtypes.boolean):
   _make_add_any_harness("dtypes", dtype=dtype)
+
 
 for dtype in jtu.dtypes.all:
   shape: tuple[int, ...] = (20, 20)
@@ -764,15 +766,6 @@ for op_name, op in _LAX_COMPARATORS.items():
     _make_comparator_harness(
         "broadcasting", lhs_shape=lhs_shape, rhs_shape=rhs_shape,
         op=op, op_name=op_name)
-
-for dtype in jtu.dtypes.all:
-  shape = (3, 4, 5)
-  define(
-      "zeros_like",
-      f"shape={jtu.format_shape_dtype_string(shape, dtype)}",
-      ad_util.zeros_like_p.bind, [RandArg(shape, dtype)],
-      shape=shape,
-      dtype=dtype)
 
 for dtype in jtu.dtypes.all_integer + jtu.dtypes.all_unsigned:
   if np.issubdtype(dtype, np.unsignedinteger):
@@ -1810,25 +1803,34 @@ for dtype in jtu.dtypes.all_floating + jtu.dtypes.complex:
   for shape in [(2, 2), (2, 7), (29, 29), (2, 3, 53), (2, 3, 29, 7)]:
     for full_matrices in [False, True]:
       for compute_uv in [False, True]:
+        subset_by_index = None
         define(
             lax.linalg.svd_p,
             f"shape={jtu.format_shape_dtype_string(shape, dtype)}_fullmatrices={full_matrices}_computeuv={compute_uv}",
             lambda *args: lax.linalg.svd_p.bind(
-                args[0], full_matrices=args[1], compute_uv=args[2]), [
-                    RandArg(shape, dtype),
-                    StaticArg(full_matrices),
-                    StaticArg(compute_uv)
-                ],
+                args[0],
+                full_matrices=args[1],
+                compute_uv=args[2],
+                subset_by_index=args[3],
+            ),
+            [
+                RandArg(shape, dtype),
+                StaticArg(full_matrices),
+                StaticArg(compute_uv),
+                StaticArg(subset_by_index),
+            ],
             jax_unimplemented=[
                 Limitation(
                     "unimplemented",
-                    devices=("cpu", "gpu"),
-                    dtypes=[np.float16, dtypes.bfloat16]),
+                    dtypes=[np.float16, dtypes.bfloat16],
+                ),
             ],
             shape=shape,
             dtype=dtype,
             full_matrices=full_matrices,
-            compute_uv=compute_uv)
+            compute_uv=compute_uv,
+            subset_by_index=subset_by_index,
+        )
 
 for dtype in jtu.dtypes.all_inexact:
   for shape in [(0, 0), (5, 5), (2, 6, 6)]:
@@ -2061,18 +2063,17 @@ def _make_slice_harness(name,
   define(
       lax.slice_p,
       f"{name}_a={jtu.format_shape_dtype_string(shape, dtype)}_{start_indices=}_{limit_indices=}_{strides=}",
-      # type: ignore
       lax.slice,
       [
-          RandArg(shape, dtype),  # type: ignore
-          StaticArg(start_indices),  # type: ignore
-          StaticArg(limit_indices),  # type: ignore
+          RandArg(shape, dtype),
+          StaticArg(start_indices),
+          StaticArg(limit_indices),
           StaticArg(strides)
-      ],  # type: ignore
+      ],
       dtype=dtype,
-      shape=shape,  # type: ignore
-      start_indices=start_indices,  # type: ignore
-      limit_indices=limit_indices)  # type: ignore
+      shape=shape,
+      start_indices=start_indices,
+      limit_indices=limit_indices)
 
 
 # Test first all dtypes
@@ -2162,17 +2163,16 @@ def _make_dynamic_slice_harness(name,
     define(
         lax.dynamic_slice_p,
         f"{name}_a={jtu.format_shape_dtype_string(shape, dtype)}_{start_indices=}_{limit_indices=}_enablexla={enable_xla}",
-        # type: ignore
         lax.dynamic_slice,
         [
-            RandArg(shape, dtype),  # type: ignore
+            RandArg(shape, dtype),
             np.array(list(start_indices)),
             StaticArg(tuple(map(operator.sub, limit_indices, start_indices)))
-        ],  # type: ignore
+        ],
         dtype=dtype,
-        shape=shape,  # type: ignore
-        start_indices=start_indices,  # type: ignore
-        limit_indices=limit_indices,  # type: ignore
+        shape=shape,
+        start_indices=start_indices,
+        limit_indices=limit_indices,
         enable_xla=enable_xla)
 
 
@@ -2219,19 +2219,19 @@ def _make_dynamic_update_slice_harness(name,
     define(
         lax.dynamic_update_slice_p,
         (
-            f"{name}_operand={jtu.format_shape_dtype_string(shape, dtype)}"  # type: ignore
+            f"{name}_operand={jtu.format_shape_dtype_string(shape, dtype)}"
             f"_update={jtu.format_shape_dtype_string(update_shape, dtype)}"
             f"_{start_indices=}_{enable_xla=}"),
         lax.dynamic_update_slice,
         [
-            RandArg(shape, dtype),  # type: ignore
-            RandArg(update_shape, dtype),  # type: ignore
+            RandArg(shape, dtype),
+            RandArg(update_shape, dtype),
             np.array(start_indices)
-        ],  # type: ignore
+        ],
         dtype=dtype,
-        shape=shape,  # type: ignore
-        start_indices=start_indices,  # type: ignore
-        update_shape=update_shape,  # type: ignore
+        shape=shape,
+        start_indices=start_indices,
+        update_shape=update_shape,
         enable_xla=enable_xla)
 
 
@@ -2262,12 +2262,12 @@ def _make_squeeze_harness(name,
                           dtype=np.float32):
   define(
       lax.squeeze_p,
-      f"{name}_inshape={jtu.format_shape_dtype_string(shape, dtype)}_{dimensions=}",  # type: ignore
+      f"{name}_inshape={jtu.format_shape_dtype_string(shape, dtype)}_{dimensions=}",
       lax.squeeze,
-      [RandArg(shape, dtype), StaticArg(dimensions)],  # type: ignore[has-type]
+      [RandArg(shape, dtype), StaticArg(dimensions)],
       dtype=dtype,
       arg_shape=shape,
-      dimensions=dimensions)  # type: ignore[has-type]
+      dimensions=dimensions)
 
 
 # Test first all dtypes
@@ -2336,7 +2336,7 @@ _make_select_and_scatter_add_harness("select_prim", select_prim=lax.le_p)
 # Validate padding
 for padding in [
     # TODO(bchetioui): commented out the test based on
-    # https://github.com/google/jax/issues/4690
+    # https://github.com/jax-ml/jax/issues/4690
     # ((1, 2), (2, 3), (3, 4)) # non-zero padding
     ((1, 1), (1, 1), (1, 1))  # non-zero padding
 ]:
@@ -2531,7 +2531,9 @@ def requires_xla_for_reduce(name, dtype):
     return True
   if name == "min" and dtype in [np.uint8, np.uint16]:
     return True
-  if name == "add" and dtype not in [np.float16, np.float32, np.float64]:
+  if name == "add" and dtype not in [
+      dtypes.bfloat16, np.float16, np.float32, np.float64
+  ]:
     return True
   return False
 
@@ -2672,7 +2674,6 @@ for dtype in (np.float32, np.float64):
         jax.jit(lambda x: jax_random.gamma(jax.random.key(42), x)),
         [RandArg(shape, dtype)],
         dtype=dtype)
-
 
 
 def wrap_and_split():
@@ -3312,6 +3313,7 @@ for padding, lhs_dilation, rhs_dilation in [
         lhs_dilation=lhs_dilation,
         rhs_dilation=rhs_dilation)
 
+key_types: list[tuple[tuple[int, ...], jax.typing.DTypeLike]]
 key_types = [((4,), np.uint32)]
 if config.enable_x64.value:
   key_types.append(((2,), np.uint64))

@@ -13,12 +13,16 @@
 # limitations under the License.
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 from jax.numpy import fft as fft
 from jax.numpy import linalg as linalg
 
 from jax._src.basearray import Array as ndarray
+
+from jax._src.dtypes import (
+    isdtype as isdtype,
+)
 
 from jax._src.numpy.lax_numpy import (
     ComplexWarning as ComplexWarning,
@@ -49,6 +53,7 @@ from jax._src.numpy.lax_numpy import (
     bincount as bincount,
     blackman as blackman,
     block as block,
+    bool_ as bool,  # Array API alias for bool_
     bool_ as bool_,
     broadcast_arrays as broadcast_arrays,
     broadcast_shapes as broadcast_shapes,
@@ -64,6 +69,7 @@ from jax._src.numpy.lax_numpy import (
     complex_ as complex_,
     complexfloating as complexfloating,
     compress as compress,
+    concat as concat,
     concatenate as concatenate,
     convolve as convolve,
     copy as copy,
@@ -189,6 +195,7 @@ from jax._src.numpy.lax_numpy import (
     packbits as packbits,
     pad as pad,
     partition as partition,
+    permute_dims as permute_dims,
     pi as pi,
     piecewise as piecewise,
     place as place,
@@ -205,7 +212,6 @@ from jax._src.numpy.lax_numpy import (
     rollaxis as rollaxis,
     rot90 as rot90,
     round as round,
-    round_ as round_,
     save as save,
     savez as savez,
     searchsorted as searchsorted,
@@ -226,6 +232,7 @@ from jax._src.numpy.lax_numpy import (
     tensordot as tensordot,
     tile as tile,
     trace as trace,
+    trapezoid as trapezoid,
     transpose as transpose,
     tri as tri,
     tril as tril,
@@ -245,14 +252,30 @@ from jax._src.numpy.lax_numpy import (
     unpackbits as unpackbits,
     unravel_index as unravel_index,
     unsignedinteger as unsignedinteger,
+    unstack as unstack,
     unwrap as unwrap,
     vander as vander,
     vdot as vdot,
+    vecdot as vecdot,
     vsplit as vsplit,
     vstack as vstack,
     where as where,
     zeros as zeros,
     zeros_like as zeros_like,
+)
+
+# TODO(slebedev): Remove the try-except once we upgrade to ml_dtypes 0.4.1.
+try:
+  from jax._src.numpy.lax_numpy import (
+    int2 as int2,
+    uint2 as uint2,
+  )
+except ImportError:
+  pass
+
+from jax._src.numpy.array_api_metadata import (
+  __array_api_version__ as __array_api_version__,
+  __array_namespace_info__ as __array_namespace_info__,
 )
 
 from jax._src.numpy.index_tricks import (
@@ -286,6 +309,7 @@ from jax._src.numpy.reductions import (
     count_nonzero as count_nonzero,
     cumsum as cumsum,
     cumprod as cumprod,
+    cumulative_sum as cumulative_sum,
     max as max,
     mean as mean,
     median as median,
@@ -318,11 +342,17 @@ from jax._src.numpy.setops import (
     setxor1d as setxor1d,
     union1d as union1d,
     unique as unique,
+    unique_all as unique_all,
+    unique_counts as unique_counts,
+    unique_inverse as unique_inverse,
+    unique_values as unique_values,
 )
 
 from jax._src.numpy.ufuncs import (
     abs as abs,
     absolute as absolute,
+    acos as acos,
+    acosh as acosh,
     add as add,
     arccos as arccos,
     arccosh as arccosh,
@@ -331,9 +361,17 @@ from jax._src.numpy.ufuncs import (
     arctan as arctan,
     arctan2 as arctan2,
     arctanh as arctanh,
+    asin as asin,
+    asinh as asinh,
+    atan as atan,
+    atanh as atanh,
+    atan2 as atan2,
     bitwise_and as bitwise_and,
     bitwise_count as bitwise_count,
+    bitwise_invert as bitwise_invert,
+    bitwise_left_shift as bitwise_left_shift,
     bitwise_not as bitwise_not,
+    bitwise_right_shift as bitwise_right_shift,
     bitwise_or as bitwise_or,
     bitwise_xor as bitwise_xor,
     cbrt as cbrt,
@@ -391,6 +429,7 @@ from jax._src.numpy.ufuncs import (
     nextafter as nextafter,
     not_equal as not_equal,
     positive as positive,
+    pow as pow,
     power as power,
     rad2deg as rad2deg,
     radians as radians,
@@ -424,7 +463,25 @@ from jax._src.numpy.array_methods import register_jax_array_methods
 register_jax_array_methods()
 del register_jax_array_methods
 
-try:
-  from numpy import issubsctype as _deprecated_issubsctype
-except ImportError:
-  _deprecated_issubsctype = None
+
+_deprecations = {
+  # Deprecated 03 Sept 2024
+  "round_": (
+    "jnp.round_ is deprecated; use jnp.round instead.",
+    round
+  ),
+  # Deprecated 18 Sept 2023 and removed 06 Feb 2024
+  "trapz": (
+    "jnp.trapz is deprecated; use jnp.trapezoid instead.",
+    None
+  ),
+}
+
+import typing
+if typing.TYPE_CHECKING:
+  round_ = round
+else:
+  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del typing

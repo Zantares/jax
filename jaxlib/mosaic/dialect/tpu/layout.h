@@ -26,8 +26,6 @@ limitations under the License.
 
 #include "absl/log/check.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/bit.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -121,6 +119,103 @@ class RectangularVregBounds : public VRegDataBounds {
   std::array<int64_t, 2> ends_;
 };
 
+// VectorLayout describes a mapping of an arbitrarily sized values into vregs.
+//
+// First, let us consider the simplest case, when implicit_dim is None, bitwidth
+// is 32, and tiling matches the vreg shape. Then, the two last dimensions of a
+// vector are tiled over sublanes and lanes respectively. If a value is too
+// large to fit within a single vreg, then it continues in another vector
+// register. For example purposes, we assume that vregs have 4 sublanes and 5
+// lanes from now on. A matrix with elements:
+//
+//   a b c d e
+//   f g h i j
+//   k l m n o
+//   p q r s t
+//
+// laid out with offsets (1, 2) will use four vregs as follows:
+//
+//   vreg 1      vreg 2
+// . . . . .    . . . . .
+// . . a b c    d e . . .
+// . . f g h    i j . . .
+// . . k l m    n o . . .
+//
+//   vreg 3      vreg 4
+// . . p q r    s t . . .
+// . . . . .    . . . . .
+// . . . . .    . . . . .
+// . . . . .    . . . . .
+//
+// The dot character indicates padding. Nothing should be assumed about the
+// value of those entries.
+//
+// If a value with this layout has rank >2, the leading dimensions will be
+// unrolled over vregs. That is, the total number of vregs used to represent
+// a value is equal to the product of all leading dimension sizes, and the
+// number of vregs necessary to lay out the last two dimensions (as in the
+// example).
+//
+// ---
+//
+// The implicit_dim attribute makes it possible to tile only the last dimension
+// of a value, by implicitly inserting a singleton dimension that is tiled over
+// sublanes (when implicit_dim is kMinor) or lanes (when implicit_dim is
+// kSecondMinor).
+//
+// When the value has only one dimension, implicit_dim must be specified.
+//
+// ---
+//
+// The tiling attribute makes it possible to subdivide a single vector register
+// into multiple subtiles that traverse the last dimension of a value. For
+// example, consider vregs of shape (4, 5) an array:
+//
+//   a b c d e f g h i j
+//   k l m n o p q r s t
+//
+// If we used a tiling of (4, 5), we would need two vregs to store this value,
+// with the lower half of every register containing padding. But, if we use a
+// tiling of (2, 5), both tiles fit into a single vreg:
+//
+//   vreg 0
+// a b c d e | tile 0
+// k l m n o |
+// f g h i j    | tile 1
+// p q r s t    |
+//
+// Tiling is especially useful for compact storage of 1D values. Without it,
+// we could use at most one sublane of every vector register. But, with a tiling
+// of (1, 128) and implicit_dim being kSecondMinor, we can use all entries in a
+// register to store long vectors.
+//
+// ---
+//
+// Finally, when the element bitwidth becomes smaller than 32, we use a two
+// level tiling scheme, where elements of consecutive rows are packed into
+// subelements. In TPU documentation this is often called a compressed layout.
+// Note that this puts restrictions on the tile sizes, as they cannot have fewer
+// rows than the packing factor (32 / bitwidth).
+//
+// Attributes:
+//   bitwidth: The bitwidth of the stored values.
+//   offsets: The coordinates of the first valid element. If an offset is
+//     replicated (nullopt), then any offset is valid as the value does not vary
+//     across sublanes or lanes respectively.
+//   tiling: The tiling used to lay out values (see the XLA docs). For values of
+//     bitwidth < 32, an implicit (32 / bitwidth, 1) tiling is appended to the
+//     one specified as an attribute.
+//   implicit_dim: If specified, the value has an implicit dim inserted in
+//     either minormost or second minormost position.
+//
+// Note: There is a special case when VectorLayout is used for an mlir::Value
+// of i1 type. In this case, we use it to represent a vmask, which has a smaller
+// bitwidth than a vreg. For these types, the packing() is accurate but the
+// bitwidth() is a lie, and the i1 value is replicated for every bit.
+// For example, if the vmask is 8 x 128 x 4 bits and packing() == 2, each 4-bit
+// register contains two logical bool values which are represented as either b11
+// or b00. Its usage is currently limited to MLIR arith.cmp and arith.select ops
+// but we might want to split out a separate class if it gets used more widely.
 class VectorLayout {
  public:
   enum class ImplicitDim {
@@ -138,11 +233,21 @@ class VectorLayout {
         implicit_dim_(implicit_dim) {
     // TODO(b/275751535): Allow more bitwidths.
     CHECK(llvm::has_single_bit<unsigned>(bitwidth_) && bitwidth_ <= 32);
-    // Offsets should not exceed the tile size. The data always starts within
-    // the first tile of a vreg.
-    for (auto [o, t] : llvm::zip(offsets_, tiling_)) {
-      CHECK(!o || 0 <= *o && *o < t);
+  }
+
+  static int num_implicit_dims(const ImplicitDim implicit_dim) {
+    switch (implicit_dim) {
+      case ImplicitDim::kNone:
+        return 0;
+      case ImplicitDim::kMinor:
+      case ImplicitDim::kSecondMinor:
+        return 1;
     }
+  }
+
+  // The number of non-implicit dimensions that are tiled.
+  static int layout_rank(const ImplicitDim implicit_dim) {
+    return 2 - num_implicit_dims(implicit_dim);
   }
 
   int8_t bitwidth() const { return bitwidth_; }
@@ -150,8 +255,8 @@ class VectorLayout {
   const std::array<int64_t, 2> &tiling() const { return tiling_; }
   ImplicitDim implicit_dim() const { return implicit_dim_; }
   int packing() const { return 32 / bitwidth_; }
-  // The number of minormost dimensions tiled by this layout.
-  int layout_rank() const { return 1 + (implicit_dim_ == ImplicitDim::kNone); }
+  int num_implicit_dims() const { return num_implicit_dims(implicit_dim_); }
+  int layout_rank() const { return layout_rank(implicit_dim_); }
 
   bool operator==(const VectorLayout &other) const;
   bool operator!=(const VectorLayout &other) const {
@@ -182,13 +287,62 @@ class VectorLayout {
     return {tiling_[0], tilesPerVreg(target_shape) * tiling_[1]};
   }
 
-  llvm::SmallVector<int64_t> implicitShape(ArrayRef<int64_t> shape) const;
+  template <typename T>
+  void insertImplicit(SmallVectorImpl<T> &vec, T value) const {
+    CHECK_GE(vec.size(), layout_rank());
+    switch (implicit_dim_) {
+      case ImplicitDim::kNone:
+        break;
+      case ImplicitDim::kMinor:
+      case ImplicitDim::kSecondMinor:
+        vec.insert(vec.end() - (static_cast<int64_t>(implicit_dim_) - 1),
+                   value);
+        break;
+    }
+  }
 
- private:
-  llvm::SmallVector<int64_t> tileArrayImplicitShape(
-      ArrayRef<int64_t> shape, std::array<int64_t, 2> target_shape) const;
+  template <typename T>
+  void eraseImplicit(SmallVectorImpl<T> &vec) const {
+    CHECK_GE(vec.size(), 2);
+    switch (implicit_dim_) {
+      case ImplicitDim::kNone:
+        break;
+      case ImplicitDim::kMinor:
+      case ImplicitDim::kSecondMinor:
+        vec.erase(vec.end() - static_cast<int64_t>(implicit_dim_));
+        break;
+    }
+  }
 
- public:
+  static std::array<int64_t, 2> getImplicitTiledDims(
+      const ImplicitDim implicit_dim, const ArrayRef<int64_t> arr,
+      const int64_t implicit_value) {
+    CHECK_GE(arr.size(), layout_rank(implicit_dim));
+    switch (implicit_dim) {
+      case ImplicitDim::kNone:
+        return {*(arr.end() - 2), *(arr.end() - 1)};
+      case ImplicitDim::kMinor:
+        return {*(arr.end() - 1), implicit_value};
+      case ImplicitDim::kSecondMinor:
+        return {implicit_value, *(arr.end() - 1)};
+    }
+  }
+
+  // Returns the value of the tiled (2 minormost) dimensions of the given array
+  // with implicit dims inserted.
+  //
+  // Roughly equivalent to the following (but avoids vector allocation):
+  //
+  //   SmallVector<int64_t> vec = arr;
+  //   insertImplicit(arr, implicit_value);
+  //   return {*(vec.end() - 2), *(vec.end() - 1)};
+  std::array<int64_t, 2> getImplicitTiledDims(
+      const ArrayRef<int64_t> arr, const int64_t implicit_value) const {
+    return getImplicitTiledDims(implicit_dim_, arr, implicit_value);
+  }
+
+  SmallVector<int64_t> implicitShape(ArrayRef<int64_t> shape) const;
+
   // Returns the shape of ndarray of vregs needed to represent a value.
   //
   // All but the last two dimensions are unrolled over vregs. In the last two
@@ -199,9 +353,31 @@ class VectorLayout {
   // minimize the number of vregs.
   //
   // Args:
-  // - shape: The shape of the full vector this layout applies to.
-  llvm::SmallVector<int64_t> tileArrayShape(
-      ArrayRef<int64_t> shape, std::array<int64_t, 2> target_shape) const;
+  //   src_is_implicit: If true, the input shape already has implicit dimensions
+  //     inserted.
+  //   res_is_implicit: If true, the output shape will have implicit dimensions
+  //     inserted.
+  //   shape: The shape of the full vector this layout applies to, possibly
+  //     with implicit dimensions inserted.
+  SmallVector<int64_t> tileArrayShape(
+      bool src_is_implicit, bool res_is_implicit, ArrayRef<int64_t> shape,
+      std::array<int64_t, 2> target_shape) const {
+    return tileArrayShape(src_is_implicit, res_is_implicit,
+                          SmallVector<int64_t>(shape), target_shape);
+  }
+  SmallVector<int64_t> tileArrayShape(
+      bool src_is_implicit, bool res_is_implicit, SmallVector<int64_t> &&shape,
+      std::array<int64_t, 2> target_shape) const;
+
+  SmallVector<int64_t> tileArrayImplicitShape(
+      ArrayRef<int64_t> shape, std::array<int64_t, 2> target_shape) const {
+    return tileArrayShape(false, true, shape, target_shape);
+  }
+
+  SmallVector<int64_t> tileArrayShape(
+      ArrayRef<int64_t> shape, std::array<int64_t, 2> target_shape) const {
+    return tileArrayShape(false, false, shape, target_shape);
+  }
 
   // Returns the bounds of the given tile that hold useful data.
   //
@@ -295,21 +471,31 @@ class VectorLayout {
                                           const VectorLayout &r,
                                           ArrayRef<int64_t> shape);
 
-  static std::optional<VectorLayout> parse(llvm::StringRef *data);
+  static std::optional<VectorLayout> parse(StringRef *data);
+
+  // Check conditions that depend on the target shape. Invariants that are
+  // independent of it are checked in the constructor.
+  bool isValid(const std::array<int64_t, 2> target_shape) const {
+    // Offsets should fall within the vreg slice, or else we have vregs that
+    // only contain padding.
+    for (auto [o, vs] : llvm::zip(offsets_, vregSlice(target_shape))) {
+      if (o.has_value() && (*o < 0 || vs <= *o)) {
+        return false;
+      }
+    }
+
+    // Tiling should neatly divide the target shape, so that every vector
+    // register ends up having the same structure.
+    // Also, every tile should occupy a fixed number of sublanes.
+    auto [num_sublanes, rem] =
+        std::div(tiling_[0] * tiling_[1], packing() * target_shape[1]);
+    return rem == 0 && target_shape[0] % num_sublanes == 0;
+  }
 
  private:
   std::tuple<std::optional<int64_t>, std::optional<int64_t>, int64_t, int64_t,
              int8_t, ImplicitDim>
   as_tuple() const;
-
-  // Check conditions that depend on the target shape. Invariants that are
-  // independent of it are checked in the constructor.
-  void verify(const std::array<int64_t, 2> target_shape) const {
-    // Tiling should neatly divide the target shape, so that every vector
-    // register ends up having the same structure.
-    // Also, every tile should occupy a fixed number of sublanes.
-    CHECK_EQ((tiling_[0] * tiling_[1]) % (packing() * target_shape[1]), 0);
-  }
 
   friend llvm::hash_code hash_value(const VectorLayout &layout);
 
@@ -327,6 +513,8 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Layout &v);
 llvm::hash_code hash_value(const VectorLayout &layout);
 mlir::Diagnostic &operator<<(mlir::Diagnostic &diag, const Layout &v);
 std::ostream &operator<<(std::ostream &os, VectorLayout::ImplicitDim dim);
+mlir::Diagnostic &operator<<(mlir::Diagnostic &diag,
+                             VectorLayout::ImplicitDim dim);
 
 std::optional<Layout> parseLayout(mlir::AsmParser &parser);
 

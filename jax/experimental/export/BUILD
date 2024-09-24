@@ -14,15 +14,14 @@
 
 # JAX-export provides APIs for exporting StableHLO for serialization purposes.
 
+load("@rules_python//python:defs.bzl", "py_library")
 load(
     "//jaxlib:jax.bzl",
     "py_deps",
 )
-load("@rules_python//python:defs.bzl", "py_library")
 
 licenses(["notice"])
 
-# Please add new users to :australis_users.
 package(
     default_applicable_licenses = [],
     default_visibility = ["//visibility:private"],
@@ -31,10 +30,7 @@ package(
 py_library(
     name = "export",
     srcs = [
-        "export.py",
-        "serialization.py",
-        "serialization_generated.py",
-        "shape_poly.py",
+        "__init__.py",
     ],
     srcs_version = "PY3",
     # TODO: b/255503696: enable pytype

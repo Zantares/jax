@@ -18,9 +18,9 @@ import unittest
 
 import numpy as np
 
+import jax
 import jax.numpy as jnp
 from jax import jit, lax, make_jaxpr
-from jax import config
 from jax.interpreters import mlir
 from jax.interpreters import xla
 
@@ -34,7 +34,7 @@ from jax._src.lib import xla_client
 xc = xla_client
 xb = xla_bridge
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 # TODO(jakevdp): use a setup/teardown method to populate and unpopulate all the
 # dictionaries associated with the following objects.
@@ -68,20 +68,17 @@ class SparseArray:
 class AbstractSparseArray(core.ShapedArray):
   __slots__ = ['index_dtype', 'nnz', 'data_aval', 'indices_aval']
 
-  def __init__(self, shape, dtype, index_dtype, nnz, weak_type=False,
-               named_shape=None):
+  def __init__(self, shape, dtype, index_dtype, nnz, weak_type=False):
     super().__init__(shape, dtypes.canonicalize_dtype(dtype))
-    named_shape = {} if named_shape is None else named_shape
     self.index_dtype = index_dtype
     self.nnz = nnz
-    self.data_aval = core.ShapedArray((nnz,), dtypes.canonicalize_dtype(dtype),
-                                      weak_type, named_shape)
+    self.data_aval = core.ShapedArray(
+        (nnz,), dtypes.canonicalize_dtype(dtype), weak_type)
     self.indices_aval = core.ShapedArray(
-        (nnz, len(shape)), dtypes.canonicalize_dtype(index_dtype),
-        named_shape=named_shape)
+        (nnz, len(shape)), dtypes.canonicalize_dtype(index_dtype))
 
   def update(self, shape=None, dtype=None, index_dtype=None, nnz=None,
-             weak_type=None, named_shape=None):
+             weak_type=None):
     if shape is None:
       shape = self.shape
     if dtype is None:
@@ -92,10 +89,7 @@ class AbstractSparseArray(core.ShapedArray):
       nnz = self.nnz
     if weak_type is None:
       weak_type = self.weak_type
-    if named_shape is None:
-      named_shape = self.named_shape
-    return AbstractSparseArray(
-        shape, dtype, index_dtype, nnz, weak_type, named_shape)
+    return AbstractSparseArray(shape, dtype, index_dtype, nnz, weak_type)
 
   def strip_weak_type(self):
     return self

@@ -13,11 +13,11 @@
 # limitations under the License.
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
 import re
 import textwrap
-from typing import Any, Callable, NamedTuple, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 import warnings
 
@@ -111,61 +111,51 @@ def _parse_parameters(body: str) -> dict[str, str]:
   return {p.partition(' : ')[0].partition(', ')[0]: p for p in parameters}
 
 
-def _parse_extra_params(extra_params: str) -> dict[str, str]:
-  """Parse the extra parameters passed to _wraps()"""
-  parameters = _parameter_break.split(extra_params.strip('\n'))
-  return {p.partition(' : ')[0].partition(', ')[0]: p for p in parameters}
-
-
-def _wraps(
-    fun: Callable[..., Any] | None,
+def implements(
+    original_fun: Callable[..., Any] | None,
     update_doc: bool = True,
     lax_description: str = "",
     sections: Sequence[str] = ('Parameters', 'Returns', 'References'),
     skip_params: Sequence[str] = (),
-    extra_params: str | None = None,
     module: str | None = None,
 ) -> Callable[[_T], _T]:
-  """Specialized version of functools.wraps for wrapping numpy functions.
+  """Decorator for JAX functions which implement a specified NumPy function.
 
-  This produces a wrapped function with a modified docstring. In particular, if
-  `update_doc` is True, parameters listed in the wrapped function that are not
-  supported by the decorated function will be removed from the docstring. For
-  this reason, it is important that parameter names match those in the original
-  numpy function.
+  This mainly contains logic to copy and modify the docstring of the original
+  function. In particular, if `update_doc` is True, parameters listed in the
+  original function that are not supported by the decorated function will
+  be removed from the docstring. For this reason, it is important that parameter
+  names match those in the original numpy function.
 
   Args:
-    fun: The function being wrapped
+    original_fun: The original function being implemented
     update_doc: whether to transform the numpy docstring to remove references of
       parameters that are supported by the numpy version but not the JAX version.
       If False, include the numpy docstring verbatim.
     lax_description: a string description that will be added to the beginning of
       the docstring.
     sections: a list of sections to include in the docstring. The default is
-      ["Parameters", "returns", "References"]
+      ["Parameters", "Returns", "References"]
     skip_params: a list of strings containing names of parameters accepted by the
       function that should be skipped in the parameter list.
-    extra_params: an optional string containing additional parameter descriptions.
-      When ``update_doc=True``, these will be added to the list of parameter
-      descriptions in the updated doc.
-    module: an optional string specifying the module from which the wrapped function
+    module: an optional string specifying the module from which the original function
       is imported. This is useful for objects such as ufuncs, where the module cannot
-      be determined from the wrapped function itself.
+      be determined from the original function itself.
   """
-  def wrap(op):
-    op.__np_wrapped__ = fun
-    # Allows this pattern: @wraps(getattr(np, 'new_function', None))
-    if fun is None:
+  def decorator(wrapped_fun):
+    wrapped_fun.__np_wrapped__ = original_fun
+    # Allows this pattern: @implements(getattr(np, 'new_function', None))
+    if original_fun is None:
       if lax_description:
-        op.__doc__ = lax_description
-      return op
-    docstr = getattr(fun, "__doc__", None)
-    name = getattr(fun, "__name__", getattr(op, "__name__", str(op)))
+        wrapped_fun.__doc__ = lax_description
+      return wrapped_fun
+    docstr = getattr(original_fun, "__doc__", None)
+    name = getattr(original_fun, "__name__", getattr(wrapped_fun, "__name__", str(wrapped_fun)))
     try:
-      mod = module or fun.__module__
+      mod = module or original_fun.__module__
     except AttributeError:
       if config.enable_checks.value:
-        raise ValueError(f"function {fun} defines no __module__; pass module keyword to _wraps.")
+        raise ValueError(f"function {original_fun} defines no __module__; pass module keyword to implements().")
     else:
       name = f"{mod}.{name}"
     if docstr:
@@ -173,11 +163,9 @@ def _wraps(
         parsed = _parse_numpydoc(docstr)
 
         if update_doc and 'Parameters' in parsed.sections:
-          code = getattr(getattr(op, "__wrapped__", op), "__code__", None)
+          code = getattr(getattr(wrapped_fun, "__wrapped__", wrapped_fun), "__code__", None)
           # Remove unrecognized parameter descriptions.
           parameters = _parse_parameters(parsed.sections['Parameters'])
-          if extra_params:
-            parameters.update(_parse_extra_params(extra_params))
           parameters = {p: desc for p, desc in parameters.items()
                         if (code is None or p in code.co_varnames)
                         and p not in skip_params}
@@ -211,18 +199,18 @@ def _wraps(
       except:
         if config.enable_checks.value:
           raise
-        docstr = fun.__doc__
+        docstr = original_fun.__doc__
 
-    op.__doc__ = docstr
+    wrapped_fun.__doc__ = docstr
     for attr in ['__name__', '__qualname__']:
       try:
-        value = getattr(fun, attr)
+        value = getattr(original_fun, attr)
       except AttributeError:
         pass
       else:
-        setattr(op, attr, value)
-    return op
-  return wrap
+        setattr(wrapped_fun, attr, value)
+    return wrapped_fun
+  return decorator
 
 _dtype = partial(dtypes.dtype, canonicalize=True)
 
@@ -248,8 +236,7 @@ def promote_shapes(fun_name: str, *args: ArrayLike) -> list[Array]:
         if config.numpy_rank_promotion.value != "allow":
           _rank_promotion_warning_or_error(fun_name, shapes)
         result_rank = len(lax.broadcast_shapes(*shapes))
-        return [_broadcast_to(arg, (1,) * (result_rank - len(shp)) + shp)
-                for arg, shp in zip(args, shapes)]
+        return [lax.broadcast_to_rank(arg, result_rank) for arg in args]
 
 
 def _rank_promotion_warning_or_error(fun_name: str, shapes: Sequence[Shape]):
@@ -418,6 +405,8 @@ def _broadcast_to(arr: ArrayLike, shape: DimSize | Shape) -> Array:
   arr_shape = np.shape(arr)
   if core.definitely_equal_shape(arr_shape, shape):
     return arr
+  elif len(shape) < len(arr_shape):
+    raise ValueError(f"Cannot broadcast to shape with fewer dimensions: {arr_shape=} {shape=}")
   else:
     nlead = len(shape) - len(arr_shape)
     shape_tail = shape[nlead:]
@@ -426,11 +415,7 @@ def _broadcast_to(arr: ArrayLike, shape: DimSize | Shape) -> Array:
     if nlead < 0 or not compatible:
       msg = "Incompatible shapes for broadcasting: {} and requested shape {}"
       raise ValueError(msg.format(arr_shape, shape))
-    diff, = np.where(tuple(not core.definitely_equal(arr_d, shape_d)
-                           for arr_d, shape_d in safe_zip(arr_shape, shape_tail)))
-    new_dims = tuple(range(nlead)) + tuple(nlead + diff)
-    kept_dims = tuple(np.delete(np.arange(len(shape)), new_dims))
-    return lax.broadcast_in_dim(lax.squeeze(arr, tuple(diff)), shape, kept_dims)
+    return lax.broadcast_in_dim(arr, shape, tuple(range(nlead, len(shape))))
 
 
 # The `jit` on `where` exists to avoid materializing constants in cases like
@@ -445,9 +430,13 @@ def _where(condition: ArrayLike, x: ArrayLike, y: ArrayLike) -> Array:
   if not np.issubdtype(_dtype(condition), np.bool_):
     condition = lax.ne(condition, lax._zero(condition))
   x, y = promote_dtypes(x, y)
-  condition_arr, x_arr, y_arr = _broadcast_arrays(condition, x, y)
+  if np.ndim(condition) == 0:
+    # lax.select() handles scalar conditions without broadcasting.
+    x_arr, y_arr = _broadcast_arrays(x, y)
+  else:
+    condition, x_arr, y_arr = _broadcast_arrays(condition, x, y)
   try:
     is_always_empty = core.is_empty_shape(x_arr.shape)
   except:
     is_always_empty = False  # can fail with dynamic shapes
-  return lax.select(condition_arr, x_arr, y_arr) if not is_always_empty else x_arr
+  return lax.select(condition, x_arr, y_arr) if not is_always_empty else x_arr

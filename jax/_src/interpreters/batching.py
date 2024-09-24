@@ -14,10 +14,10 @@
 from __future__ import annotations
 
 import collections
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 import dataclasses
 from functools import partial
-from typing import Any, Callable, Union
+from typing import Any, Union
 
 import numpy as np
 
@@ -26,9 +26,9 @@ from jax._src import config
 from jax._src import core
 from jax._src import source_info_util
 from jax._src import linear_util as lu
-from jax._src.ad_util import (add_jaxvals, add_jaxvals_p, zeros_like_jaxval,
-                              zeros_like_p, Zero, SymbolicZero,
-                              replace_rule_output_symbolic_zeros, instantiate)
+from jax._src.ad_util import (Zero, instantiate, SymbolicZero,
+                              replace_rule_output_symbolic_zeros,
+                              add_jaxvals, add_jaxvals_p)
 from jax._src.core import raise_to_shaped, Trace, Tracer, AxisName
 from jax._src.interpreters import partial_eval as pe
 from jax._src.tree_util import (tree_unflatten, tree_flatten,
@@ -88,6 +88,7 @@ def _jumble_flatten(jumble):
   elt_ty = jumble.aval.elt_ty.update(shape=tuple(new_shape))
   aval = jumble.aval.replace(elt_ty=elt_ty)
   return (lengths, jumble.data), aval
+
 def _jumble_unflatten(aval, x):
   lengths, data = x
   new_shape = [d.replace(lengths=lengths[d.lengths - 1])
@@ -99,7 +100,7 @@ def _jumble_unflatten(aval, x):
 register_pytree_node(Jumble, _jumble_flatten, _jumble_unflatten)
 
 def _jumble_result(axis_size, stacked_axis, ragged_axes, x):
-  binder = core.Var(0, '', core.ShapedArray((), np.dtype('int32')))
+  binder = core.Var('', core.ShapedArray((), np.dtype('int32')))
   if stacked_axis != 0:
     raise NotImplementedError  # TODO Transpose x so the stacked axis is axis 0
   shape = list(x.shape)
@@ -162,7 +163,7 @@ def bdim_as_shape(
     bdim: int | RaggedAxis, data_shape: core.Shape) -> core.Shape:
   if isinstance(bdim, RaggedAxis):
     result = list(data_shape)
-    binder = core.Var(0, '', core.ShapedArray((), np.dtype('int32')))
+    binder = core.Var('', core.ShapedArray((), np.dtype('int32')))
     for ragged_axis, segment_lens in bdim.ragged_axes:
       result[ragged_axis] = IndexedAxisSize(binder, segment_lens)
     return tuple(result)
@@ -200,7 +201,7 @@ def _update_annotation(
   class Name:
     def __init__(self, a): self.a = a
   names = [Name(a) for a, _  in orig_type]
-  avals = [a.update(shape=tuple(names[d.val] if type(d) is pe.DBIdx else d  # type: ignore
+  avals = [a.update(shape=tuple(names[d.val] if type(d) is pe.DBIdx else d
                                 for d in a.shape))
            if type(a) is core.DShapedArray else a for a, e in orig_type if e]
 
@@ -245,20 +246,25 @@ def to_elt(trace: Trace, get_idx: GetIdx, x: Vmappable, spec: MapSpec) -> Elt:
                  for i, sz in enumerate(x.aval.elt_ty.shape)
                  if type(sz) is IndexedAxisSize)
     batch_axis = make_batch_axis(x.data.ndim, 0, [(d+1, ias.lengths)])
-    return BatchTracer(trace, x.data, batch_axis)  # type: ignore
+    return BatchTracer(trace, x.data, batch_axis)
   elif isinstance(spec, int) or spec is None:
     spec = spec and canonicalize_axis(spec, len(np.shape(x)))
     return (BatchTracer(trace, x, spec, source_info_util.current())
             if spec is not None else x)
   else:
-    assert False
+    # TODO(mvoz): This is a terrible place to fall into if you pass
+    # a non jumble type in, make it clearer what went wrong.
+    assert False, f'Unexpected type in ELT? {type(x)}'
+
 to_elt_handlers: dict[type, ToEltHandler] = {}
 
-def from_elt(trace: BatchTrace, axis_size: AxisSize, x: Elt, spec: MapSpec
-             ) -> Vmappable:
+def from_elt(trace: BatchTrace, axis_size: AxisSize, i: int,
+             x: Elt, spec: MapSpec) -> Vmappable:
   handler = from_elt_handlers.get(type(x))
   if handler:
-    return handler(partial(from_elt, trace), axis_size, x, spec)
+    def _cont(axis_size, elt, axis):
+      return from_elt(trace, axis_size, i, elt, axis)
+    return handler(_cont, axis_size, x, spec)
   x_ = trace.full_raise(x)
   val, bdim = x_.val, x_.batch_dim
   if type(bdim) is RaggedAxis:
@@ -267,7 +273,10 @@ def from_elt(trace: BatchTrace, axis_size: AxisSize, x: Elt, spec: MapSpec
       raise TypeError("ragged output without using jumble_axis out_axes spec")
     return _jumble_result(axis_size, bdim.stacked_axis, bdim.ragged_axes, val)
   else:
-    return matchaxis(trace.axis_name, axis_size, x_.batch_dim, spec, x_.val)
+    try:
+      return matchaxis(trace.axis_name, axis_size, x_.batch_dim, spec, x_.val)
+    except SpecMatchError:
+      raise SpecMatchError(i, x_.batch_dim, spec) from None
 from_elt_handlers: dict[type, FromEltHandler] = {}
 
 def make_iota(axis_size: AxisSize) -> Array:
@@ -322,7 +331,7 @@ class BatchTracer(Tracer):
       assert type(batch_dim) in (NotMapped, int, RaggedAxis)
       if type(batch_dim) is int:
         aval = raise_to_shaped(core.get_aval(val))
-        assert 0 <= batch_dim < len(aval.shape)  # type: ignore
+        assert 0 <= batch_dim < len(aval.shape)
     self._trace = trace
     self.val = val
     self.batch_dim = batch_dim
@@ -338,7 +347,7 @@ class BatchTracer(Tracer):
     elif type(self.batch_dim) is RaggedAxis:
       new_aval = core.mapped_aval(
         aval.shape[self.batch_dim.stacked_axis], self.batch_dim.stacked_axis, aval)
-      shape = list(new_aval.shape)  # type: ignore
+      shape = list(new_aval.shape)  # pytype: disable=attribute-error
       for ragged_axis, segment_lengths in self.batch_dim.ragged_axes:
         size_tracer = BatchTracer(self._trace, segment_lengths, 0)
         if self.batch_dim.stacked_axis < ragged_axis:
@@ -635,7 +644,8 @@ def _batch_inner(axis_size, out_dim_dests, main, in_dims, *in_vals):
   in_tracers = map(partial(to_elt, trace, idx), in_vals, in_dims)
   outs = yield in_tracers, {}
   out_dim_dests = out_dim_dests() if callable(out_dim_dests) else out_dim_dests
-  out_vals = map(partial(from_elt, trace, axis_size), outs, out_dim_dests)
+  out_vals = map(partial(from_elt, trace, axis_size), range(len(outs)),
+                 outs, out_dim_dests)
   yield out_vals
 
 # NOTE: This divides the in_axes by the tile_size and multiplies the out_axes by it.
@@ -789,7 +799,7 @@ def _batch_jaxpr2(
   avals_in2 = [core.unmapped_aval(axis_size, axis_name, b, aval)
                if b is not not_mapped else aval
                for aval, b in unsafe_zip(avals_in, in_axes2)]
-  jaxpr_out, _, consts = pe.trace_to_jaxpr_dynamic(f, avals_in2)
+  jaxpr_out, _, consts, () = pe.trace_to_jaxpr_dynamic(f, avals_in2)
   return core.ClosedJaxpr(jaxpr_out, consts), out_axes()
 
 def handle_ragged(in_avals: list[core.AbstractValue], dim: RaggedAxis,
@@ -834,7 +844,7 @@ def _batch_jaxpr_axes(closed_jaxpr, axis_size, in_axes, out_axes_dest,
                          main_type)
   avals_in = [core.unmapped_aval(axis_size, axis_name, b, aval) if b is not not_mapped
               else aval for aval, b in unsafe_zip(closed_jaxpr.in_avals, in_axes)]
-  jaxpr_out, _, consts = pe.trace_to_jaxpr_dynamic(f, avals_in)
+  jaxpr_out, _, consts, () = pe.trace_to_jaxpr_dynamic(f, avals_in)
   return core.ClosedJaxpr(jaxpr_out, consts), out_batched()
 
 @lu.transformation_with_aux
@@ -1098,7 +1108,7 @@ def matchaxis(axis_name, sz, src, dst, x, sum_match=False):
   if dst == jumble_axis:
     x = bdim_at_front(x, src, sz)
     elt_ty = x.aval.update(shape=x.shape[1:])
-    aval = JumbleTy(core.Var(0, '', core.ShapedArray((), np.dtype('int32'))),
+    aval = JumbleTy(core.Var('', core.ShapedArray((), np.dtype('int32'))),
                     x.shape[0], elt_ty)
     return Jumble(aval, x)
   try:
@@ -1119,7 +1129,13 @@ def matchaxis(axis_name, sz, src, dst, x, sum_match=False):
         axis_name is not core.no_axis_name):
       raise ValueError(f'vmap has mapped output ({axis_name=}) but out_axes is {dst}')
     else:
-      raise ValueError(f'vmap has mapped output but out_axes is {dst}')
+      raise SpecMatchError(None, None, None)
+
+class SpecMatchError(Exception):
+  def __init__(self, leaf_idx, src, dst):
+    self.leaf_idx = leaf_idx
+    self.src = src
+    self.dst = dst
 
 def bdim_at_front(x, bdim, size):
   if bdim is not_mapped:
@@ -1127,7 +1143,6 @@ def bdim_at_front(x, bdim, size):
   else:
     return moveaxis(x, bdim, 0)
 
-# sets up primitive batchers for ad_util and xla primitives
 
 def add_batched(batched_args, batch_dims):
   bdx, bdy = batch_dims
@@ -1144,9 +1159,3 @@ def add_batched(batched_args, batch_dims):
     x = moveaxis(x, bdx, bdy)
     return add_jaxvals(x, y), bdy
 primitive_batchers[add_jaxvals_p] = add_batched
-
-def zeros_like_batched(batched_args, batch_dims):
-  val, = batched_args
-  bdim, = batch_dims
-  return zeros_like_jaxval(val), bdim
-primitive_batchers[zeros_like_p] = zeros_like_batched

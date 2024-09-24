@@ -16,18 +16,18 @@ import collections
 from functools import partial
 import operator
 
-import jax
 from jax.tree_util import (tree_flatten, treedef_children, tree_leaves,
                            tree_unflatten, treedef_tuple)
 from jax._src import ad_util
+from jax._src import api
 from jax._src import core
+from jax._src import custom_derivatives
 from jax._src import linear_util as lu
 from jax._src.core import raise_to_shaped
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import xla
-from jax._src.lax import lax
 from jax._src.traceback_util import api_boundary
 from jax._src.util import split_list, safe_map
 import numpy as np
@@ -50,7 +50,7 @@ def _split_root_args(args, const_lengths):
 
 @api_boundary
 def custom_root(f, initial_guess, solve, tangent_solve, has_aux=False):
-  """Differentiably solve for a roots of a function.
+  """Differentiably solve for the roots of a function.
 
   This is a low-level routine, mostly intended for internal use in JAX.
   Gradients of custom_root() are defined with respect to closed-over variables
@@ -100,7 +100,7 @@ def custom_root(f, initial_guess, solve, tangent_solve, has_aux=False):
   _check_tree("solve", "initial_guess", solution_tree, in_tree, has_aux)
 
   def linearize_and_solve(x, b):
-    unchecked_zeros, f_jvp = jax.linearize(f, x)
+    unchecked_zeros, f_jvp = api.linearize(f, x)
     return tangent_solve(f_jvp, b)
 
   l_and_s_jaxpr, l_and_s_consts, out_tree = _initial_style_jaxpr(
@@ -116,7 +116,7 @@ def custom_root(f, initial_guess, solve, tangent_solve, has_aux=False):
   return tree_unflatten(solution_tree, solution_flat)
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 1))
+@partial(custom_derivatives.custom_jvp, nondiff_argnums=(0, 1))
 def _custom_root(const_lengths, jaxprs, *args):
   params, initial_guess = _split_root_args(args, const_lengths)
   solution = core.jaxpr_as_fun(jaxprs.solve)(*(params.solve + initial_guess))
@@ -152,7 +152,7 @@ def _root_jvp(const_lengths, jaxprs, primals, tangents):
       operator.neg, linearize_and_solve(*solution, *rhs))
   # append aux, create symbolic zero tangents for the aux values
   solution += aux
-  solution_dot += _map(lax.zeros_like_array, aux)
+  solution_dot += _map(ad_util.zeros_like_jaxval, aux)
 
   return solution, solution_dot
 
@@ -170,7 +170,7 @@ def _split_linear_solve_args(args, const_lengths):
 
 
 def _transpose_one_output(linear_fun, primals):
-  transpose_fun = jax.linear_transpose(linear_fun, primals)
+  transpose_fun = api.linear_transpose(linear_fun, primals)
   def transposed_fun(x):
     (y,) = transpose_fun(x)
     return y
@@ -316,7 +316,7 @@ def _tangent_linear_map(func, params, params_dot, *x):
   this function computes ``∂A @ x``.
   """
   assert any(type(p) is not ad_util.Zero for p in params_dot)
-  zeros = _map(ad_util.Zero.from_value, x)
+  zeros = _map(ad_util.Zero.from_primal_value, x)
   _, out_tangent = ad.jvp(lu.wrap_init(func)).call_wrapped(
       params + list(x), params_dot + zeros)
   return out_tangent
@@ -352,7 +352,7 @@ def _custom_linear_solve_jvp(primals, tangents, const_lengths, jaxprs):
   # split into x tangents and aux tangents (these become zero)
   dx_leaves, daux_leaves = split_list(x_dot, [num_x_leaves])
 
-  daux_leaves = _map(ad_util.Zero.from_value, daux_leaves)
+  daux_leaves = _map(ad_util.Zero.from_primal_value, daux_leaves)
 
   x_dot = dx_leaves + daux_leaves
 

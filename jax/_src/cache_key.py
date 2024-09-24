@@ -18,6 +18,7 @@ import io
 import logging
 import os
 import sys
+from typing import cast as type_cast
 
 from jax._src import config
 from jax._src.lib import version_str as jaxlib_version_str
@@ -51,6 +52,15 @@ def get_flag_prefixes() -> list[str]:
   return _extra_flag_prefixes
 
 
+def custom_hook() -> str:
+  """Custom hook for any addition to the cache key.
+
+  The custom hook will be called everytime get() is called and can be
+  defined to return a string that will be hashed into the cache key.
+  """
+  return ""
+
+
 def get(module: ir.Module,
         devices: np.ndarray,
         compile_options: xla_client.CompileOptions,
@@ -73,7 +83,8 @@ def get(module: ir.Module,
    'jit__psum-14ac577cdb2ef6d986078b4054cc9893a9a14a16dbb0d8f37b89167c1f1aacdf'
   """
   entries = [
-      ("computation", lambda hash_obj: _hash_computation(hash_obj, module)),
+      ("computation",
+       lambda hash_obj: _hash_computation(hash_obj, module)),
       ("jax_lib version",
        lambda hash_obj: hash_obj.update(
            bytes(jaxlib_version_str.encode("utf-8")))),
@@ -81,11 +92,15 @@ def get(module: ir.Module,
        lambda hash_obj: _hash_xla_flags(hash_obj, get_flag_prefixes())),
       ("compile_options",
        lambda hash_obj: _hash_serialized_compile_options(
-           hash_obj, compile_options)),
+           hash_obj, compile_options,
+           # In case of GPU multi-process tasks we need to strip device
+           # assignment to use cache key as invariant between processes.
+           strip_device_assignment=(backend.platform == "gpu"))),
       ("accelerator_config",
          lambda hash_obj: _hash_accelerator_config(hash_obj, devices, backend)),
       ("compression",
        lambda hash_obj: _hash_string(hash_obj, compression_algorithm)),
+      ("custom_hook", lambda hash_obj: _hash_string(hash_obj, custom_hook())),
   ]
 
   hash_obj = hashlib.sha256()
@@ -115,15 +130,33 @@ def _log_cache_key_hash(hash_obj, last_serialized: str, hashfn):
     )
 
 
+def _remove_custom_partitioning_ptr(m: ir.Module):
+  """
+  Removes custom_partitioning callback pointer from precompiled IR.
+  Python function pointers are not deterministic across executions.
+  """
+  def _update_bc_attribute(op: ir.Operation) -> ir.WalkResult:
+    if (op.name == "stablehlo.custom_call" and
+        op.attributes["call_target_name"].value == "CustomSPMDPartitioning"):
+      op.attributes["backend_config"] = ir.StringAttr.get("REMOVED")
+    return ir.WalkResult.ADVANCE
+
+  m.operation.walk(_update_bc_attribute)
+  return m
+
+
 def _serialize_ir(m: ir.Module) -> bytes:
   output = io.BytesIO()
+  if config.remove_custom_partitioning_ptr_from_cache_key.value:
+    m = _remove_custom_partitioning_ptr(type_cast(ir.Module,
+                                                  m.operation.clone()))
   m.operation.write_bytecode(file=output)
   return output.getvalue()
 
 
 def _canonicalize_ir(m_original: ir.Module) -> bytes:
   with m_original.context:
-    m = m_original.operation.clone()
+    m = type_cast(ir.Module, m_original.operation.clone())
     passes = pm.PassManager.parse(
         "builtin.module(strip-debuginfo)"
     )
@@ -162,7 +195,8 @@ def _hash_accelerator_config(hash_obj, accelerators: np.ndarray, backend):
     _hash_platform(hash_obj, backend)
 
 
-def _hash_serialized_compile_options(hash_obj, compile_options_obj):
+def _hash_serialized_compile_options(hash_obj, compile_options_obj,
+                                     strip_device_assignment=False):
   # Do not mess with the original CompileOptions object since it is passed to
   # the compiler. Create a deep copy for the purpose of cache key generation.
   compile_options_copy = copy.deepcopy(compile_options_obj)
@@ -191,8 +225,23 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj):
   debug_options.xla_dump_hlo_as_long_text = False
   debug_options.xla_dump_disable_metadata = False
   debug_options.xla_dump_hlo_pipeline_re = ""
+  # Optional way to specify the cuda install path to be used by the compiler.
+  # This could possibly affect the cuda version compiled with, but this should
+  # already be included in the platform information (and might not be reflected
+  # by the cuda path regardless, since this only hashes on the directory name
+  # and not the contents). It can also cause spurious cache misses if the cuda
+  # path changes across runs despite being the same version, so we clear it
+  # here.
+  debug_options.xla_gpu_cuda_data_dir = ""
   # LINT.ThenChange(:xla_flags)
 
+  if strip_device_assignment and compile_options_copy.device_assignment:
+    replica_count = compile_options_copy.device_assignment.replica_count()
+    computation_count = compile_options_copy.device_assignment.computation_count()
+    compile_options_copy.device_assignment = xla_client.DeviceAssignment.create(
+        np.arange(replica_count * computation_count).reshape(
+          [replica_count, computation_count])
+    )
   return hash_obj.update(compile_options_copy.SerializeAsString())
 
 
@@ -225,6 +274,7 @@ def _hash_xla_flags(hash_obj, extra_flag_prefixes: list[str]):
       "--xla_dump_hlo_pipeline_re",
       "--xla_tpu_sdc_checker_streamz_metric",
       "--xla_tpu_sdc_checker_enable_sdc_event_callbacks",
+      "--xla_gpu_cuda_data_dir",
   ]
   # LINT.ThenChange(:debug_options)
 
@@ -245,7 +295,7 @@ def _hash_xla_flags(hash_obj, extra_flag_prefixes: list[str]):
 
   # N.B. all XLA flags that take an argument must use '=' and not a space
   # (e.g. --xla_force_host_platform_device_count=8) (I think).
-  for flag in xla_flags:
+  for flag in sorted(xla_flags):
     if flag.split("=")[0] in xla_flags_to_exclude_from_cache_key:
       logger.debug("Not including XLA flag in cache key: %s", flag)
       continue

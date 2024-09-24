@@ -13,8 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
+
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/Casting.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -23,8 +24,12 @@ limitations under the License.
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
+#include "absl/log/check.h"
+#include "mlir/include/mlir/IR/BuiltinTypeInterfaces.h"
+#include "mlir/include/mlir/IR/BuiltinTypes.h"
 #include "mlir/include/mlir/IR/IRMapping.h"
 #include "jaxlib/mosaic/dialect/tpu/tpu_dialect.h"
+#include "jaxlib/mosaic/dialect/tpu/util.h"
 
 namespace mlir {
 namespace tpu {
@@ -32,7 +37,7 @@ namespace tpu {
 LogicalResult UnrollVectorsOp::canonicalize(UnrollVectorsOp op,
                                             PatternRewriter &rewriter) {
   RollVectorsOp roll_op =
-      llvm::dyn_cast_or_null<RollVectorsOp>(op.getOperand().getDefiningOp());
+      dyn_cast_or_null<RollVectorsOp>(op.getOperand().getDefiningOp());
   if (!roll_op) {
      return failure();
   }
@@ -46,6 +51,34 @@ LogicalResult UnrollVectorsOp::canonicalize(UnrollVectorsOp op,
     }
   }
   rewriter.replaceOp(op, roll_op.getOperands());
+  return success();
+}
+
+LogicalResult BitcastOp::verify() {
+  auto in_ty = getInput().getType();
+  auto out_ty = getOutput().getType();
+  auto in_bitwidth = in_ty.getElementTypeBitWidth();
+  auto out_bitwidth = out_ty.getElementTypeBitWidth();
+  if (in_bitwidth != out_bitwidth) {
+    if (in_ty.getRank() < 2 || out_ty.getRank() < 2) {
+      return emitError(
+          "Not implemented: bitcast between different bitwidths on a 1D "
+          "vector.");
+    }
+    SmallVector<int64_t, 4> in_shape(in_ty.getShape());
+    SmallVector<int64_t, 4> out_shape(out_ty.getShape());
+    *(in_shape.end() - 2) *= in_bitwidth;
+    *(out_shape.end() - 2) *= out_bitwidth;
+    if (in_shape != out_shape) {
+      return emitError(
+          "Expected input and output shapes are the same after multiplying the "
+          "second-minor dimension by the ratio of bitwidths.");
+    }
+  } else if (in_ty.getShape() != out_ty.getShape()) {
+    return emitError(
+        "Expected input and output shapes are the same when bitwidth does not "
+        "change.");
+  }
   return success();
 }
 
@@ -64,7 +97,8 @@ LogicalResult MemRefSliceOp::verify() {
       (target_memory_space == nullptr ||
        target_memory_space == source_type.getMemorySpace()) &&
       ((isa<AffineMapAttr>(target_layout) && target_layout.isIdentity()) ||
-       target_type.getLayout() == source_type.getLayout()));
+       target_type.getLayout() == source_type.getLayout()) &&
+      getDynamicSizes().size() == target_type.getNumDynamicDims());
 }
 
 LogicalResult MemRefSliceOp::canonicalize(MemRefSliceOp op,
@@ -80,8 +114,9 @@ LogicalResult MemRefSliceOp::canonicalize(MemRefSliceOp op,
   auto new_result_type = MemRefType::get(
       op.getResult().getType().getShape(), layout_ty.getElementType(),
       layout_ty.getLayout(), layout_ty.getMemorySpace());
-  auto slice = rewriter.create<MemRefSliceOp>(op.getLoc(), new_result_type,
-                                              layout_ref, op.getBaseIdx());
+  auto slice =
+      rewriter.create<MemRefSliceOp>(op.getLoc(), new_result_type, layout_ref,
+                                     op.getBaseIdx(), op.getDynamicSizes());
   rewriter.replaceOpWithNewOp<EraseLayoutOp>(op, op.getType(), slice);
   return success();
 }
@@ -97,9 +132,8 @@ LogicalResult MemRefSqueezeOp::verify() {
     emitOpError("Memory spaces do not match.");
     return failure();
   }
-  if (target_type.getElementTypeBitWidth() !=
-      source_type.getElementTypeBitWidth()) {
-    this->emitOpError("Element bitwidths do not match in memref_squeeze.");
+  if (target_type.getElementType() != source_type.getElementType()) {
+    this->emitOpError("Element types don't match.");
     return failure();
   }
   auto source_shape = source_type.getShape();
@@ -151,8 +185,8 @@ LogicalResult MemRefSqueezeOp::canonicalize(MemRefSqueezeOp op,
   int target_index = target_shape.size() - 1;
   auto old_layout = dyn_cast<tpu::TiledLayoutAttr>(layout_ty.getLayout());
   auto target_strides = old_layout.getTileStrides();
-  llvm::SmallVector<int64_t> tile_strides(target_strides.begin(),
-                                          target_strides.end());
+  SmallVector<int64_t> tile_strides(target_strides.begin(),
+                                    target_strides.end());
   // We want to remove all strides that correspond to squeezed dimensions and
   // update the corresponding output layout.
   while (source_index >= 0 || target_index >= 0) {
@@ -180,12 +214,269 @@ LogicalResult MemRefSqueezeOp::canonicalize(MemRefSqueezeOp op,
   return success();
 }
 
+LogicalResult MemRefReshapeOp::verify() {
+  auto src_ty = getMemRefType(getInput());
+  auto tgt_ty = getType();
+  if (tgt_ty.getMemorySpace() != nullptr &&
+      tgt_ty.getMemorySpace() != src_ty.getMemorySpace()) {
+    return emitOpError("Memory spaces do not match.");
+  }
+  if (src_ty.getShape().size() < 2 || tgt_ty.getShape().size() < 2) {
+    return emitError("Not implemented: 1d memref reshape.");
+  }
+  if (tgt_ty.getElementType() != src_ty.getElementType()) {
+    return emitOpError("Element types don't match.");
+  }
+  auto src_elements_num = ShapedType::getNumElements(src_ty.getShape());
+  auto tgt_elements_num = ShapedType::getNumElements(tgt_ty.getShape());
+  if (src_elements_num != tgt_elements_num) {
+    return emitOpError(
+        "Number of elements doesn't match between input and output memref "
+        "type.");
+  }
+  // Source and target attributes may be different before propagation is done by
+  // the canonicalizer, so we allow this when attributes are "unset" in the
+  // target type.
+  auto tgt_layout = dyn_cast<tpu::TiledLayoutAttr>(tgt_ty.getLayout());
+  if (!tgt_layout) {
+    return success();
+  }
+  auto src_layout = dyn_cast<tpu::TiledLayoutAttr>(src_ty.getLayout());
+  if (!src_layout || src_layout.getTiles().empty()) {
+    return emitOpError("Expected a tiled layout for the input memref.");
+  }
+  if (src_layout.getTiles() != tgt_layout.getTiles()) {
+    return emitOpError(
+        "Expected the same tiling for the input and output memref.");
+  }
+  auto tile = src_layout.getTiles().front().dimensions();
+  if (tile.size() != 2) {
+    return emitOpError("Not implemented: memref reshape with 1D tiling.");
+  }
+  SmallVector<int64_t> src_tile_strides(src_layout.getTileStrides());
+  if (ComputeTileStrides(src_ty, tile) != src_tile_strides) {
+    return emitOpError("Not implemented: reshape on a non-contiguous memref.");
+  }
+  auto src_tiled_shape = src_ty.getShape().take_back(2);
+  auto tgt_tiled_shape = tgt_ty.getShape().take_back(2);
+  bool is_src_align_tile_2nd_minor = src_tiled_shape[0] % tile[0] == 0;
+  bool is_src_align_tile_minor = src_tiled_shape[1] % tile[1] == 0;
+  bool is_tgt_align_tile_2nd_minor = tgt_tiled_shape[0] % tile[0] == 0;
+  bool is_tgt_align_tile_minor = tgt_tiled_shape[1] % tile[1] == 0;
+  if (tile[0] == 1 && is_src_align_tile_minor && is_tgt_align_tile_minor) {
+    // When the tiling is (1, ?) and the source and target shapes are aligned
+    // to the tile, we support reshape on any dims.
+  } else if (tgt_tiled_shape[1] != src_tiled_shape[1]) {
+    return emitError("Expected the minormost dimension to be unchanged");
+  } else if (tgt_tiled_shape[0] != src_tiled_shape[0]) {
+    if (!is_src_align_tile_2nd_minor || !is_tgt_align_tile_2nd_minor) {
+      return emitError(
+          "Expected the 2nd minor dimension is aligned to the tile");
+    }
+  }
+  return success();
+}
+
+LogicalResult MemRefReshapeOp::canonicalize(MemRefReshapeOp op,
+                                            PatternRewriter &rewriter) {
+  auto src_ty = op.getInput().getType();
+  auto dst_ty = op.getType();
+  auto erase_layout_op = op.getInput().getDefiningOp<tpu::EraseLayoutOp>();
+  if (!erase_layout_op) {
+    return failure();
+  }
+  auto layout_ref = erase_layout_op.getOperand();
+  auto layout_ty = layout_ref.getType();
+  auto layout =
+      dyn_cast<tpu::TiledLayoutAttr>(layout_ty.getLayout());
+  CHECK(!layout.getTiles().empty());
+  auto tile = layout.getTiles().front().dimensions();
+  auto new_tile_strides = ComputeTileStrides(dst_ty, tile);
+  auto new_layout = tpu::TiledLayoutAttr::get(
+      src_ty.getContext(), layout.getTiles(), new_tile_strides);
+  auto new_result_ty =
+      MemRefType::get(dst_ty.getShape(), dst_ty.getElementType(), new_layout,
+                      layout_ty.getMemorySpace());
+  auto reshape =
+      rewriter.create<MemRefReshapeOp>(op.getLoc(), new_result_ty, layout_ref);
+  rewriter.replaceOpWithNewOp<EraseLayoutOp>(op, op.getType(), reshape);
+  return success();
+}
+
+LogicalResult MemRefBitcastOp::verify() {
+  auto src_ty = getMemRefType(getInput());
+  auto tgt_ty = getType();
+  if (tgt_ty.getMemorySpace() != nullptr &&
+      tgt_ty.getMemorySpace() != src_ty.getMemorySpace()) {
+    return emitOpError("Memory spaces do not match.");
+  }
+  if (src_ty.getRank() != tgt_ty.getRank()) {
+    return emitOpError("Ranks do not match.");
+  }
+  if (src_ty.getRank() <= 1) {
+    return emitOpError("Not implemented: 1d memref bitcast.");
+  }
+  auto src_bitwidth = src_ty.getElementTypeBitWidth();
+  auto tgt_bitwidth = tgt_ty.getElementTypeBitWidth();
+  for (int i = 0; i < src_ty.getRank(); ++i) {
+    auto src_dim_size = src_ty.getDimSize(i);
+    auto tgt_dim_size = tgt_ty.getDimSize(i);
+    if (i == src_ty.getRank() - 2) {
+      auto src_bits = src_dim_size * src_bitwidth;
+      auto tgt_bits = tgt_dim_size * tgt_bitwidth;
+      if (src_bits != tgt_bits) {
+        return emitOpError(
+                   "Expected the same number of bits on the 2nd minormost "
+                   "dim: (")
+               << src_dim_size << " * " << src_bitwidth << ") vs ("
+               << tgt_dim_size << " * " << tgt_bitwidth << ")";
+        ;
+      }
+    } else {
+      if (src_dim_size != tgt_dim_size) {
+        return emitOpError("Expected the same dim size on dim ")
+               << i << ": " << src_dim_size << " vs " << tgt_dim_size;
+      }
+    }
+  }
+  // Source and target attributes may be different before propagation is done by
+  // the canonicalizer, so we allow this when attributes are "unset" in the
+  // target type.
+  auto tgt_layout = dyn_cast<tpu::TiledLayoutAttr>(tgt_ty.getLayout());
+  if (!tgt_layout) {
+    return success();
+  }
+  auto src_layout = dyn_cast<tpu::TiledLayoutAttr>(src_ty.getLayout());
+  if (!src_layout) {
+    return emitOpError("Expected a tiled layout for the input memref.");
+  }
+  // TODO(jevinjiang): verify memref tiling is valid. Here we just assume the
+  // source and target tilings are valid.
+  auto src_tile = src_layout.getTiles().front().dimensions();
+  auto tgt_tile = tgt_layout.getTiles().front().dimensions();
+  if (src_tile[0] * src_bitwidth != tgt_tile[0] * tgt_bitwidth) {
+    return emitOpError("Invalid memref bitcast.");
+  }
+  return success();
+}
+
+LogicalResult MemRefBitcastOp::canonicalize(MemRefBitcastOp op,
+                                            PatternRewriter &rewriter) {
+  auto src_ty = op.getInput().getType();
+  auto dst_ty = op.getType();
+  if (src_ty == dst_ty) {
+    rewriter.replaceOp(op, op.getInput());
+    return success();
+  }
+  auto erase_layout_op = op.getInput().getDefiningOp<tpu::EraseLayoutOp>();
+  if (!erase_layout_op) {
+    return failure();
+  }
+  auto src_bitwidth = src_ty.getElementTypeBitWidth();
+  auto tgt_bitwidth = dst_ty.getElementTypeBitWidth();
+  auto layout_ref = erase_layout_op.getOperand();
+  auto layout_ty = layout_ref.getType();
+  auto layout = cast<tpu::TiledLayoutAttr>(layout_ty.getLayout());
+  CHECK(!layout.getTiles().empty());
+  auto tile = layout.getTiles().front().dimensions();
+  if (tile[0] * src_bitwidth % tgt_bitwidth != 0) {
+    return failure();
+  }
+  SmallVector<xla::Tile, 2> new_tiles =
+      {xla::Tile({tile[0] * src_bitwidth / tgt_bitwidth, 128})};
+  if (tgt_bitwidth < 32) {
+    new_tiles.push_back(xla::Tile({32 / tgt_bitwidth, 1}));
+  }
+  auto new_layout = tpu::TiledLayoutAttr::get(src_ty.getContext(), new_tiles,
+                                              layout.getTileStrides());
+  auto new_result_ty =
+      MemRefType::get(dst_ty.getShape(), dst_ty.getElementType(), new_layout,
+                      layout_ty.getMemorySpace());
+  auto bitcast =
+      rewriter.create<MemRefBitcastOp>(op.getLoc(), new_result_ty, layout_ref);
+  rewriter.replaceOpWithNewOp<EraseLayoutOp>(op, op.getType(), bitcast);
+  return success();
+}
+
+template <typename Op>
+LogicalResult verifyStridedOp(Op op, MemRefType memref_ty,
+                              VectorType vector_ty) {
+  auto indices = op.getIndices();
+  auto strides = op.getStrides();
+  if (memref_ty.getRank() != indices.size()) {
+    op.emitError("Base memref's rank and indices size do not match: ")
+        << memref_ty.getRank() << " vs " << indices.size();
+    return failure();
+  }
+  if (memref_ty.getRank() != strides.size()) {
+    op.emitError("Base memref's rank and strides size do not match: ")
+        << memref_ty.getRank() << " vs " << strides.size();
+    return failure();
+  }
+  if (memref_ty.getRank() != vector_ty.getRank()) {
+    op.emitError("Base memref's rank and result's rank do not match: ")
+        << memref_ty.getRank() << " vs " << vector_ty.getRank();
+    return failure();
+  }
+  for (int64_t i = 0; i < memref_ty.getRank(); ++i) {
+    if (strides[i] < 1) {
+      op.emitError("Strides[") << i << "]=" << strides[i] << " must be >= 1";
+      return failure();
+    }
+  }
+  return success();
+}
+
+LogicalResult StridedLoadOp::verify() {
+  return verifyStridedOp<StridedLoadOp>(*this, getMemRefType(getBase()),
+                                        getType());
+}
+
+LogicalResult StridedStoreOp::verify() {
+  return verifyStridedOp<StridedStoreOp>(*this, getMemRefType(getBase()),
+                                         getValueToStore().getType());
+}
+
 LogicalResult ReinterpretCastOp::verify() {
   auto source_type = getMemRefType(getInput());
   auto target_type = getType();
   return success(
       source_type.getMemorySpace() &&  // Require memory space annotations.
       source_type.getMemorySpace() == target_type.getMemorySpace());
+}
+
+template <typename Op>
+LogicalResult verifyRotateOp(Op op) {
+  auto vty = op.getResult().getType();
+  if (vty.getRank() <= op.getDimension() || op.getDimension() < 0) {
+    op.emitOpError("Invalid dimension: ") << op.getDimension();
+    return failure();
+  }
+  if (op.getStride().has_value() && op.getStride().value() < 0) {
+    op.emitOpError("Rotate stride must be >= 0 if it is specified");
+    return failure();
+  }
+  if (op.getStrideDimension().has_value() &&
+      (vty.getRank() <= op.getStrideDimension().value() ||
+       op.getStrideDimension().value() < 0)) {
+    op.emitOpError("Invalid stride dimension: ")
+        << op.getStrideDimension().value();
+    return failure();
+  }
+  if (op.getStride().has_value() != op.getStrideDimension().has_value()) {
+    op.emitOpError(
+        "Expected  either none or both stride and stride dimension are "
+        "present");
+    return failure();
+  }
+  return success();
+}
+
+// TODO(b/347016737): deprecate static rotate
+LogicalResult RotateOp::verify() { return verifyRotateOp<RotateOp>(*this); }
+
+LogicalResult DynamicRotateOp::verify() {
+  return verifyRotateOp<DynamicRotateOp>(*this);
 }
 
 // a + matmul(l, r, 0) == matmul(l, r, a)
@@ -196,7 +487,7 @@ class CanonicalizeAddOfMatmul : public OpRewritePattern<AddOp> {
   LogicalResult matchAndRewrite(AddOp op, PatternRewriter &rewriter) const {
     auto try_canonicalize = [&](Value maybe_matmul, Value maybe_acc) {
       auto matmul = dyn_cast_if_present<MatmulOp>(maybe_matmul.getDefiningOp());
-      if (!matmul) {
+      if (!matmul || !matmul->hasOneUse()) {
         return failure();
       }
       if (auto const_acc = matmul.getAcc().getDefiningOp<arith::ConstantOp>();
@@ -210,8 +501,9 @@ class CanonicalizeAddOfMatmul : public OpRewritePattern<AddOp> {
       }
       return failure();
     };
-    return success(succeeded(try_canonicalize(op.getLhs(), op.getRhs())) ||
-                   succeeded(try_canonicalize(op.getLhs(), op.getRhs())));
+    // We tried try_canonicalize(op.getRhs(), op.getLhs()) and it caused
+    // worrying numerical differences in some of kernels.
+    return try_canonicalize(op.getLhs(), op.getRhs());
   }
 };
 
@@ -234,6 +526,139 @@ LogicalResult MaskCastOp::verify() {
   return success();
 }
 
+LogicalResult GetBarrierSemaphoreOp::verify() {
+  auto sem_type = getMemRefType(getResult());
+  if (sem_type.getRank() != 0) {
+    emitOpError("Barrier semaphore reference must be rank 0");
+    return failure();
+  }
+  return success();
+}
+
+LogicalResult SemaphoreSignalOp::verify() {
+  auto sem_type = getMemRefType(getSemaphore());
+  if (sem_type.getRank() != 0) {
+    return emitOpError("Semaphore reference must be rank 0");
+  }
+  return success();
+}
+
+LogicalResult EnqueueDMAOp::verify() {
+  auto source_sem = getSourceSemaphore();
+  if (source_sem) {
+    auto source_sem_type = getMemRefType(getSourceSemaphore());
+    if (source_sem_type.getRank() != 0) {
+      return emitOpError("DMA source semaphore reference must be rank 0");
+    }
+  }
+  auto target_sem_type = getMemRefType(getTargetSemaphore());
+  if (target_sem_type.getRank() != 0) {
+    return emitOpError("DMA target semaphore must be rank 0");
+  }
+  if (getDeviceId() || getCoreId()) {
+    if (!getSourceSemaphore()) {
+      return emitOpError(
+          "DMA source semaphore must be specified when "
+          "device_id or core_id is specified");
+    }
+  }
+  return success();
+}
+
+LogicalResult WaitDMAOp::verify() {
+  auto sem_type = getMemRefType(getSemaphore());
+  if (sem_type.getRank() != 0) {
+    emitOpError("DMA wait semaphore must be rank 0");
+    return failure();
+  }
+  return success();
+}
+
+LogicalResult RegionOp::verify() {
+  for (auto result_type : getResultTypes()) {
+    if (!isa<FloatType, IntegerType, VectorType, IndexType>(result_type)) {
+      return emitOpError(
+          "Region result must be float, int, index or a vector type.");
+    }
+  }
+  return success();
+}
+
+LogicalResult ShuffledLoadOp::verify() {
+  if (getBase().getType().getRank() != getIndices().size()) {
+    return emitOpError("Base memref's rank and indices size do not match: ")
+           << getBase().getType().getRank() << " vs " << getIndices().size();
+  }
+  if (getSublaneMask().size() != getType().getShape()[0]) {
+    return emitOpError("Expected sublane mask size equals to ")
+           << getType().getShape()[0] << " but got " << getSublaneMask().size();
+  }
+  if (getSublaneOffsets().size() != getType().getShape()[0]) {
+    return emitOpError("Expected sublane offsets size equals to ")
+           << getType().getShape()[0] << " but got "
+           << getSublaneOffsets().size();
+  }
+  return success();
+}
+
+LogicalResult ShuffledLoadOp::canonicalize(ShuffledLoadOp op,
+                                           PatternRewriter &rewriter) {
+  bool can_convert_to_simple_load = true;
+  for (int i = 0; i < op.getSublaneOffsets().size(); ++i) {
+    if (op.getSublaneOffsets()[i] != i) {
+      can_convert_to_simple_load = false;
+      break;
+    };
+  }
+  if (can_convert_to_simple_load) {
+    rewriter.replaceOpWithNewOp<tpu::LoadOp>(
+        op, op.getType(), op.getBase(), op.getIndices(), op.getSublaneMask(),
+        /*sublane_stride=*/nullptr);
+  }
+  return success();
+}
+
+LogicalResult ShuffledStoreOp::verify() {
+  if (getBase().getType().getRank() != getIndices().size()) {
+    return emitOpError("Base memref's rank and indices size do not match: ")
+           << getBase().getType().getRank() << " vs " << getIndices().size();
+  }
+  if (getValueToStore().getType().getRank() != getIndices().size()) {
+    return emitOpError(
+               "The rank of value to store and indices size do not match: ")
+           << getBase().getType().getRank() << " vs " << getIndices().size();
+  }
+  if (getSublaneMask().size() != getValueToStore().getType().getShape()[0]) {
+    return emitOpError("Expected sublane mask size equals to ")
+           << getValueToStore().getType().getShape()[0] << " but got "
+           << getSublaneMask().size();
+  }
+  if (getSublaneOffsets().size() != getValueToStore().getType().getShape()[0]) {
+    return emitOpError("Expected sublane offsets size equals to ")
+           << getValueToStore().getType().getShape()[0] << " but got "
+           << getSublaneOffsets().size();
+  }
+  return success();
+}
+
+LogicalResult ShuffledStoreOp::canonicalize(ShuffledStoreOp op,
+                                            PatternRewriter &rewriter) {
+  bool can_convert_to_simple_store = true;
+  for (int i = 0; i < op.getSublaneOffsets().size(); ++i) {
+    if (op.getSublaneOffsets()[i] != i) {
+      can_convert_to_simple_store = false;
+      break;
+    };
+  }
+  if (can_convert_to_simple_store) {
+    rewriter.replaceOpWithNewOp<tpu::StoreOp>(op, op.getValueToStore(),
+                                              op.getBase(), op.getIndices(),
+                                              op.getSublaneMask(),
+                                              /*mask=*/nullptr,
+                                              /*sublane_stride=*/nullptr);
+  }
+  return success();
+}
 }  // namespace tpu
 }  // namespace mlir
 

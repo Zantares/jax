@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from jax._src.interpreters.ad import (
   add_jaxvals as add_jaxvals,
   add_jaxvals_p as add_jaxvals_p,
   add_tangents as add_tangents,
-  backward_pass as backward_pass,
+  backward_pass as backward_pass_internal,
   bilinear_transpose as bilinear_transpose,
   call_param_updaters as call_param_updaters,
   call_transpose as call_transpose,
@@ -59,9 +59,7 @@ from jax._src.interpreters.ad import (
   primitive_jvps as primitive_jvps,
   primitive_transposes as primitive_transposes,
   rearrange_binders as rearrange_binders,
-  recast_to_float0 as recast_to_float0,
   reducing_transposes as reducing_transposes,
-  replace_float0s as replace_float0s,
   standard_jvp as standard_jvp,
   standard_jvp2 as standard_jvp2,
   traceable as traceable,
@@ -73,28 +71,22 @@ from jax._src.interpreters.ad import (
   zeros_like_p as zeros_like_p,
 )
 
-from jax import config as _deprecated_config
-from jax._src import source_info_util as _deprecated_source_info_util
 _deprecations = {
-    # Added Oct 13, 2023:
+    # Finalized Mar 18, 2024; remove after June 18, 2024
     "config": (
-        "jax.interpreters.ad.config is deprecated. Import jax.config directly.",
-        _deprecated_config,
+        "jax.interpreters.ad.config is deprecated. Use jax.config directly.",
+        None,
     ),
     "source_info_util": (
         "jax.interpreters.ad.source_info_util is deprecated. Use jax.extend.source_info_util.",
-        _deprecated_source_info_util,
+        None,
     ),
 }
 
-import typing
-if typing.TYPE_CHECKING:
-  config = _deprecated_config
-  source_info_util = _deprecated_source_info_util
-else:
-  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
-  __getattr__ = _deprecation_getattr(__name__, _deprecations)
-  del _deprecation_getattr
-del typing
-del _deprecated_config
-del _deprecated_source_info_util
+def backward_pass(jaxpr, reduce_axes, transform_stack,
+                  consts, primals_in, cotangents_in):
+  if reduce_axes:
+    raise NotImplementedError("reduce_axes on ad.backward_pass is deprecated")
+  del reduce_axes
+  return backward_pass_internal(
+      jaxpr, transform_stack, consts, primals_in, cotangents_in)

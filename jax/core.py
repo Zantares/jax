@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Note: import <name> as <name> is required for names to be exported.
-# See PEP 484 & https://github.com/google/jax/issues/7570
+# See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 from jax._src.core import (
   AbstractToken as AbstractToken,
@@ -42,7 +42,6 @@ from jax._src.core import (
   MainTrace as MainTrace,
   MapPrimitive as MapPrimitive,
   NameGatheringSubst as NameGatheringSubst,
-  NamedShape as NamedShape,
   OutDBIdx as OutDBIdx,
   OutputType as OutputType,
   ParamDict as ParamDict,
@@ -61,18 +60,13 @@ from jax._src.core import (
   Var as Var,
   abstract_token as abstract_token,
   apply_todos as apply_todos,
-  as_named_shape as as_named_shape,
   aval_mapping_handlers as aval_mapping_handlers,
   axis_frame as axis_frame,
   call as call,
   call_bind_with_continuation as call_bind_with_continuation,
   call_impl as call_impl,
   call_p as call_p,
-  canonicalize_shape as _deprecated_canonicalize_shape,
-  check_eqn as check_eqn,
   check_jaxpr as check_jaxpr,
-  check_type as check_type,
-  check_valid_jaxtype as check_valid_jaxtype,
   closed_call_p as closed_call_p,
   concrete_aval as concrete_aval,
   concrete_or_error as concrete_or_error,
@@ -80,8 +74,6 @@ from jax._src.core import (
   cur_sublevel as cur_sublevel,
   custom_typechecks as custom_typechecks,
   dedup_referents as dedup_referents,
-  definitely_equal as _deprecated_definitely_equal,
-  dimension_as_value as _deprecated_dimension_as_value,
   do_subst_axis_names_jaxpr as do_subst_axis_names_jaxpr,
   ensure_compile_time_eval as ensure_compile_time_eval,
   escaped_tracer_error as escaped_tracer_error,
@@ -93,6 +85,7 @@ from jax._src.core import (
   full_lower as full_lower,
   gensym as gensym,
   get_aval as get_aval,
+  get_type as get_type,
   get_referent as get_referent,
   is_constant_dim as is_constant_dim,
   is_constant_shape as is_constant_shape,
@@ -100,7 +93,6 @@ from jax._src.core import (
   jaxpr_uses_outfeed as jaxpr_uses_outfeed,
   jaxprs_in_params as jaxprs_in_params,
   join_effects as join_effects,
-  join_named_shapes as join_named_shapes,
   lattice_join as lattice_join,
   leaked_tracer_error as leaked_tracer_error,
   literalable_types as literalable_types,
@@ -116,20 +108,7 @@ from jax._src.core import (
   new_sublevel as new_sublevel,
   no_axis_name as no_axis_name,
   no_effects as no_effects,
-  non_negative_dim as non_negative_dim,
   outfeed_primitives as outfeed_primitives,
-  pp_aval as pp_aval,
-  pp_eqn as pp_eqn,
-  pp_eqn_rules as pp_eqn_rules,
-  pp_eqns as pp_eqns,
-  pp_jaxpr as pp_jaxpr,
-  pp_jaxpr_eqn_range as pp_jaxpr_eqn_range,
-  pp_jaxpr_skeleton as pp_jaxpr_skeleton,
-  pp_jaxprs as pp_jaxprs,
-  pp_kv_pair as pp_kv_pair,
-  pp_kv_pairs as pp_kv_pairs,
-  pp_var as pp_var,
-  pp_vars as pp_vars,
   primal_dtype_to_tangent_dtype as primal_dtype_to_tangent_dtype,
   primitive_uses_outfeed as primitive_uses_outfeed,
   process_env_traces_call as process_env_traces_call,
@@ -148,7 +127,6 @@ from jax._src.core import (
   subst_axis_names_var as subst_axis_names_var,
   substitute_vars_in_output_ty as substitute_vars_in_output_ty,
   thread_local_state as thread_local_state,
-  token as token,
   trace_state_clean as trace_state_clean,
   traverse_jaxpr_params as traverse_jaxpr_params,
   typecheck as typecheck,
@@ -163,138 +141,72 @@ from jax._src.core import (
 
 from jax._src import core as _src_core
 _deprecations = {
-    # Added Oct 11, 2023:
+    # Added 2024-08-14
+    "check_eqn": ("jax.core.check_eqn is deprecated.", _src_core.check_eqn),
+    "check_type": ("jax.core.check_type is deprecated.", _src_core.check_type),
+    "check_valid_jaxtype": (
+      ("jax.core.check_valid_jaxtype is deprecated. Instead, you can manually"
+       " raise an error if core.valid_jaxtype() returns False."),
+      _src_core.check_valid_jaxtype),
+    # Added 2024-06-12
+    "pp_aval": ("jax.core.pp_aval is deprecated.", _src_core.pp_aval),
+    "pp_eqn": ("jax.core.pp_eqn is deprecated.", _src_core.pp_eqn),
+    "pp_eqn_rules": ("jax.core.pp_eqn_rules is deprecated.", _src_core.pp_eqn_rules),
+    "pp_eqns": ("jax.core.pp_eqns is deprecated.", _src_core.pp_eqns),
+    "pp_jaxpr": ("jax.core.pp_jaxpr is deprecated.", _src_core.pp_jaxpr),
+    "pp_jaxpr_eqn_range": ("jax.core.pp_jaxpr_eqn_range is deprecated.", _src_core.pp_jaxpr_eqn_range),
+    "pp_jaxpr_skeleton": ("jax.core.pp_jaxpr_skeleton is deprecated.", _src_core.pp_jaxpr_skeleton),
+    "pp_jaxprs": ("jax.core.pp_jaxprs is deprecated.", _src_core.pp_jaxprs),
+    "pp_kv_pair": ("jax.core.pp_kv_pair is deprecated.", _src_core.pp_kv_pair),
+    "pp_kv_pairs": ("jax.core.pp_kv_pairs is deprecated.", _src_core.pp_kv_pairs),
+    "pp_var": ("jax.core.pp_var is deprecated.", _src_core.pp_var),
+    "pp_vars": ("jax.core.pp_vars is deprecated.", _src_core.pp_vars),
+    # Finalized 2024-05-13; remove after 2024-08-13
     "DimSize": (
         "jax.core.DimSize is deprecated. Use DimSize = int | Any.",
-        _src_core.DimSize,
+        None,
     ),
     "Shape": (
         "jax.core.Shape is deprecated. Use Shape = Sequence[int | Any].",
-        _src_core.Shape,
+        None,
     ),
-    "TracerArrayConversionError": (
-        "jax.core.TracerArrayConversionError is deprecated. Use jax.errors.TracerArrayConversionError",
-        _src_core.TracerArrayConversionError,
-    ),
-    "TracerIntegerConversionError": (
-        "jax.core.TracerIntegerConversionError is deprecated. Use jax.errors.TracerIntegerConversionError",
-        _src_core.TracerIntegerConversionError,
-    ),
-    "UnexpectedTracerError": (
-        "jax.core.UnexpectedTracerError is deprecated. Use jax.errors.UnexpectedTracerError",
-        _src_core.UnexpectedTracerError,
-    ),
-    "as_hashable_function": (
-        "jax.core.as_hashable_function is deprecated. Use jax.util.as_hashable_function directly.",
-        _src_core.as_hashable_function,
-    ),
-    "collections": (
-        "jax.core.collections is deprecated. Use the collections module directly.",
-        _src_core.collections,
-    ),
-    "dtypes": (
-        "jax.core.dtypes is deprecated. Use jax.dtypes directly.",
-        _src_core.dtypes,
-    ),
-    "lu": (
-        "jax.core.lu is deprecated. Use lu = jax.extend.linear_util",
-        _src_core.lu,
-    ),
-    "map": (
-        "jax.core.map is deprecated. Use the built-in map function.",
-        _src_core.map,
-    ),
-    "namedtuple": (
-        "jax.core.namedtuple is deprecated. Use collections.namedtuple directly.",
-        _src_core.namedtuple,
-    ),
-    "partial": (
-        "jax.core.partial is deprecated. Use functools.partial directly.",
-        _src_core.partial,
-    ),
-    "pp": (
-        "jax.core.pp is deprecated. jax._src.pretty_printer is a non-public API.",
-        _src_core.pp,
-    ),
-    "ref": (
-        "jax.core.ref is deprecated. Use weakref.ref directly.",
-        _src_core.ref,
-    ),
-    "safe_map": (
-        "jax.core.safe_map is deprecated. Use jax.util.safe_map directly.",
-        _src_core.safe_map,
-    ),
-    "safe_zip": (
-        "jax.core.safe_zip is deprecated. Use jax.util.safe_zip directly.",
-        _src_core.safe_zip,
-    ),
-    "source_info_util": (
-        "jax.core.source_info_util is deprecated. Use jax.extend.source_info_util.",
-        _src_core.source_info_util,
-    ),
-    "total_ordering": (
-        "jax.core.total_ordering is deprecated. Use functools.total_ordering directly.",
-        _src_core.total_ordering,
-    ),
-    "traceback_util": (
-        "jax.core.traceback_util is deprecated. jax._src.traceback_util is a non-public API.",
-        _src_core.traceback_util,
-    ),
-    "tuple_delete": (
-        "jax.core.tuple_delete is deprecated. Use tuple_delete = lambda t, i: (*t[:i], *t[i+1:])",
-        _src_core.tuple_delete,
-    ),
-    "tuple_insert": (
-        "jax.core.tuple_insert is deprecated. Use tuple_insert = lambda t, v, i: (*t[:i], v, *t[i:])",
-        _src_core.tuple_insert,
-    ),
-    "zip": (
-        "jax.core.zip is deprecated. Use the built-in zip function.",
-        _src_core.zip,
-    ),
-    # Added Dec 15, 2023
+    # Finalized 2024-06-24; remove after 2024-09-24
     "canonicalize_shape": (
-      "jax.core.canonicalize_shape is deprecated.", _deprecated_canonicalize_shape,
+      "jax.core.canonicalize_shape is deprecated.", None,
     ),
     "dimension_as_value": (
-      "jax.core.dimension_as_value is deprecated.", _deprecated_dimension_as_value,
+      "jax.core.dimension_as_value is deprecated. Use jnp.array.", None,
     ),
     "definitely_equal": (
-      "jax.core.definitely_equal is deprecated.", _deprecated_definitely_equal,
+      "jax.core.definitely_equal is deprecated. Use ==.", None,
     ),
     "symbolic_equal_dim": (
-      "jax.core.symbolic_equal_dim is deprecated.", _deprecated_definitely_equal,
+      "jax.core.symbolic_equal_dim is deprecated. Use ==.", None,
+    ),
+    # Added Jan 8, 2024
+    "non_negative_dim": (
+      "jax.core.non_negative_dim is deprecated. Use max_dim(..., 0).", _src_core.non_negative_dim,
     ),
 }
 
 import typing
 if typing.TYPE_CHECKING:
-  DimSize = _src_core.DimSize
-  Shape = _src_core.Shape
-  TracerArrayConversionError = _src_core.TracerArrayConversionError
-  TracerIntegerConversionError = _src_core.TracerIntegerConversionError
-  UnexpectedTracerError = _src_core.UnexpectedTracerError
-  as_hashable_function = _src_core.as_hashable_function
-  canonicalize_shape = _deprecated_canonicalize_shape
-  collections = _src_core.collections
-  dimension_as_value = _deprecated_dimension_as_value
-  definitely_equal = _deprecated_definitely_equal
-  dtypes = _src_core.dtypes
-  lu = _src_core.lu
-  map = _src_core.map
-  namedtuple = _src_core.namedtuple
-  partial = _src_core.partial
-  pp = _src_core.pp
-  ref = _src_core.ref
-  safe_map = _src_core.safe_map
-  safe_zip = _src_core.safe_zip
-  source_info_util = _src_core.source_info_util
-  symbolic_equal_dim = _deprecated_definitely_equal
-  total_ordering = _src_core.total_ordering
-  traceback_util = _src_core.traceback_util
-  tuple_delete = _src_core.tuple_delete
-  tuple_insert = _src_core.tuple_insert
-  zip = _src_core.zip
+  check_eqn = _src_core.check_eqn
+  check_type = _src_core.check_type
+  check_valid_jaxtype = _src_core.check_valid_jaxtype
+  non_negative_dim = _src_core.non_negative_dim
+  pp_aval = _src_core.pp_aval
+  pp_eqn = _src_core.pp_eqn
+  pp_eqn_rules = _src_core.pp_eqn_rules
+  pp_eqns = _src_core.pp_eqns
+  pp_jaxpr = _src_core.pp_jaxpr
+  pp_jaxpr_eqn_range = _src_core.pp_jaxpr_eqn_range
+  pp_jaxpr_skeleton = _src_core.pp_jaxpr_skeleton
+  pp_jaxprs = _src_core.pp_jaxprs
+  pp_kv_pair = _src_core.pp_kv_pair
+  pp_kv_pairs = _src_core.pp_kv_pairs
+  pp_var = _src_core.pp_var
+  pp_vars = _src_core.pp_vars
 else:
   from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
   __getattr__ = _deprecation_getattr(__name__, _deprecations)

@@ -23,8 +23,72 @@ from jax._src.dispatch import (
   apply_primitive as apply_primitive,
 )
 
-from jax._src import xla_bridge as xb
-from jax._src.lib import xla_client as xc  # type: ignore
+from jax._src import xla_bridge as _xb
+from jax._src.lib import xla_client as _xc
 
-xe = xc._xla
-Backend = xe.Client
+_xe = _xc._xla
+Backend = _xe.Client
+
+# Deprecations
+_deprecations = {
+    # Added 2024-06-28
+    "xb": (
+        "jax.interpreters.xla.xb is deprecated. Use jax.lib.xla_bridge instead.",
+        _xb
+    ),
+    "xc": (
+        "jax.interpreters.xla.xc is deprecated. Use jax.lib.xla_client instead.",
+        _xc,
+    ),
+    "xe": (
+        "jax.interpreters.xla.xe is deprecated. Use jax.lib.xla_extension instead.",
+        _xe,
+    ),
+    # Finalized 2024-05-13; remove after 2024-08-13
+    "backend_specific_translations": (
+        "jax.interpreters.xla.backend_specific_translations is deprecated. "
+        "Register custom primitives via jax.interpreters.mlir instead.",
+        None,
+    ),
+    "translations": (
+        "jax.interpreters.xla.translations is deprecated. "
+        "Register custom primitives via jax.interpreters.mlir instead.",
+        None,
+    ),
+    "register_translation": (
+        "jax.interpreters.xla.register_translation is deprecated. "
+        "Register custom primitives via jax.interpreters.mlir instead.",
+        None,
+    ),
+    "xla_destructure": (
+        "jax.interpreters.xla.xla_destructure is deprecated. "
+        "Register custom primitives via jax.interpreters.mlir instead.",
+        None,
+    ),
+    "TranslationRule": (
+        "jax.interpreters.xla.TranslationRule is deprecated. "
+        "Register custom primitives via jax.interpreters.mlir instead.",
+        None,
+    ),
+    "TranslationContext": (
+        "jax.interpreters.xla.TranslationContext is deprecated. "
+        "Register custom primitives via jax.interpreters.mlir instead.",
+        None,
+    ),
+    "XlaOp": (
+        "jax.interpreters.xla.XlaOp is deprecated. "
+        "Register custom primitives via jax.interpreters.mlir instead.",
+        None,
+    ),
+}
+
+import typing
+from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
+if typing.TYPE_CHECKING:
+  xb = _xb
+  xc = _xc
+  xe = _xe
+else:
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+del _deprecation_getattr
+del typing

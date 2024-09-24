@@ -29,8 +29,10 @@ limitations under the License.
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectImplementation.h"  // IWYU pragma: keep.
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "absl/hash/hash.h"
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"
 #include "jaxlib/mosaic/dialect/tpu/tpu_dialect.cc.inc"
 #include "jaxlib/mosaic/dialect/tpu/tpu_enums.cc.inc"
 #include "xla/layout.h"
@@ -102,7 +104,7 @@ Attribute TiledLayoutAttr::parse(AsmParser &parser, Type type) {
   if (failed(parser.parseLess())) {
     return {};
   }
-  llvm::SmallVector<xla::Tile, 2> tiles;
+  SmallVector<xla::Tile, 2> tiles;
   int64_t size;
   while (succeeded(parser.parseOptionalLParen())) {
     xla::Tile &tile = tiles.emplace_back();
@@ -120,7 +122,7 @@ Attribute TiledLayoutAttr::parse(AsmParser &parser, Type type) {
       tile.add_dimensions(size);
     }
   }
-  llvm::SmallVector<int64_t, 2> tile_strides;
+  SmallVector<int64_t, 2> tile_strides;
   int64_t stride;
   if (failed(parser.parseComma())) {
     return {};
@@ -181,6 +183,31 @@ MemRefType getMemRefType(Value value) {
     value = erase_op.getOperand();
   }
   return cast<MemRefType>(value.getType());
+}
+
+bool isGuaranteedDivisible(Value value, int64_t divisor, int64_t fuel) {
+  if (fuel <= 0) {
+    return false;
+  }
+  if (divisor == 1) {
+    return true;
+  }
+  if (auto assume_op = value.getDefiningOp<tpu::AssumeMultipleOp>()) {
+    return assume_op.getMultiple() % divisor == 0;
+  }
+  if (auto mul_op = value.getDefiningOp<arith::MulIOp>()) {
+    // We check RHS first, because MLIR canonicalizes constants to the right.
+    return isGuaranteedDivisible(mul_op.getRhs(), divisor, fuel / 2) ||
+           isGuaranteedDivisible(mul_op.getLhs(), divisor, (fuel + 1) / 2);
+  }
+  if (auto cst_op = value.getDefiningOp<arith::ConstantOp>()) {
+    auto int_attr = dyn_cast<IntegerAttr>(cst_op.getValue());
+    return int_attr && int_attr.getInt() % divisor == 0;
+  }
+  if (auto cast_op = value.getDefiningOp<arith::IndexCastOp>()) {
+    return isGuaranteedDivisible(cast_op.getOperand(), divisor, fuel - 1);
+  }
+  return false;
 }
 
 }  // namespace mlir::tpu

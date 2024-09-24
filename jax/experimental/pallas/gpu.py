@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contains Triton specific Pallas functions."""
-try:
-  from jax._src.pallas import triton
-  get_compute_capability = triton.get_compute_capability
-  del triton
-except ImportError as e:
-  raise ImportError("Cannot import Pallas Triton backend. "
-                    "Make sure you've installed jax-triton.") from e
+"""Triton-specific Pallas APIs."""
+
+from jax._src.pallas.triton.core import TritonCompilerParams
+from jax._src.pallas.triton.primitives import approx_tanh
+from jax._src.pallas.triton.primitives import debug_barrier
+from jax._src.pallas.triton.primitives import elementwise_inline_asm

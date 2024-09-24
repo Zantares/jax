@@ -14,19 +14,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import enum
 import operator
 from functools import partial
 import math
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 import weakref
 
 import numpy as np
 
-import jax
-
 from jax._src import ad_util
+from jax._src import api
 from jax._src import config
 from jax._src import core
 from jax._src import dispatch
@@ -232,7 +231,7 @@ class GatherDimensionNumbers(NamedTuple):
       in the output of the gather. Must be a tuple of integers in ascending
       order.
     start_index_map: for each dimension in `start_indices`, gives the
-      corresponding dimension in `operand` that is to be sliced. Must be a
+      corresponding dimension in the `operand` that is to be sliced. Must be a
       tuple of integers with size equal to `start_indices.shape[-1]`.
 
   Unlike XLA's `GatherDimensionNumbers` structure, `index_vector_dim` is
@@ -261,8 +260,8 @@ class GatherScatterMode(enum.Enum):
     will be discarded.
   PROMISE_IN_BOUNDS:
     The user promises that indices are in bounds. No additional checking will be
-    performed. In practice, with the current XLA  implementation this means
-    that, out-of-bounds gathers will be clamped but out-of-bounds scatters will
+    performed. In practice, with the current XLA implementation this means
+    that out-of-bounds gathers will be clamped but out-of-bounds scatters will
     be discarded. Gradients will not be correct if indices are out-of-bounds.
   """
   CLIP = enum.auto()
@@ -370,7 +369,7 @@ class ScatterDimensionNumbers(NamedTuple):
       are the mirror image of `collapsed_slice_dims` in the case of `gather`.
     scatter_dims_to_operand_dims: for each dimension in `scatter_indices`, gives
       the corresponding dimension in `operand`. Must be a sequence of integers
-      with size equal to indices.shape[-1].
+      with size equal to `scatter_indices.shape[-1]`.
 
   Unlike XLA's `ScatterDimensionNumbers` structure, `index_vector_dim` is
   implicit; there is always an index vector dimension and it must always be the
@@ -772,7 +771,7 @@ def slice_in_dim(operand: Array | np.ndarray, start_index: int | None,
   axis = int(axis)
   start_indices[axis] = start_index_int
   limit_indices[axis] = limit_index_int
-  strides[axis] = int(stride)
+  strides[axis] = core._canonicalize_dimension(stride)
 
   return slice(operand, start_indices, limit_indices, strides)
 
@@ -1363,7 +1362,7 @@ def _dynamic_update_slice_jvp(primals, tangents):
   g_operand, g_update = tangents[:2]
   val_out = dynamic_update_slice_p.bind(operand, update, *start_indices)
   if type(g_operand) is ad_util.Zero and type(g_update) is ad_util.Zero:
-    tangent_out = ad_util.Zero.from_value(val_out)
+    tangent_out = ad_util.Zero.from_primal_value(val_out)
   else:
     g_operand = ad.instantiate_zeros(g_operand)
     g_update = ad.instantiate_zeros(g_update)
@@ -1401,7 +1400,7 @@ def _dynamic_update_slice_batching_rule(batched_args, batch_dims):
                                   inserted_window_dims=(),
                                   scatter_dims_to_operand_dims=dims)
   index, index_bdim = _batch_dynamic_slice_indices(start_idx, start_idx_bd)
-  return jax.vmap(
+  return api.vmap(
     partial(scatter, dimension_numbers=dnums,
             indices_are_sorted=True, unique_indices=True,
             mode=GatherScatterMode.CLIP),
@@ -1784,7 +1783,7 @@ def _gather_lower_opaque(ctx, operand, indices, *,
                          indices_are_sorted, mode, fill_value) -> ir.Value:
   aval_x, aval_indices = ctx.avals_in
   aval_y, = ctx.avals_out
-  elt_shape = aval_x.dtype._rules.physical_element_aval(aval_x.dtype).shape
+  elt_shape = core.physical_element_aval(aval_x.dtype).shape
   trailing_offset_dims = [aval_y.ndim + i for i in range(len(elt_shape))]
   dimension_numbers = dimension_numbers._replace(
       offset_dims=(*dimension_numbers.offset_dims, *trailing_offset_dims))
@@ -1821,10 +1820,13 @@ def _gather_lower(ctx, operand, indices, *,
   assert mode in (GatherScatterMode.PROMISE_IN_BOUNDS,
                   GatherScatterMode.CLIP), mode
   dnums = hlo.GatherDimensionNumbers.get(
-    collapsed_slice_dims=list(dimension_numbers.collapsed_slice_dims),
-    index_vector_dim=len(ctx.avals_in[1].shape) - 1,
-    offset_dims=list(dimension_numbers.offset_dims),
-    start_index_map=list(dimension_numbers.start_index_map))
+      collapsed_slice_dims=list(dimension_numbers.collapsed_slice_dims),
+      operand_batching_dims=[],
+      start_indices_batching_dims=[],
+      index_vector_dim=len(ctx.avals_in[1].shape) - 1,
+      offset_dims=list(dimension_numbers.offset_dims),
+      start_index_map=list(dimension_numbers.start_index_map),
+  )
   if not core.is_constant_shape(slice_sizes):
     slice_sizes = mlir.eval_dynamic_shape_as_tensor(ctx, slice_sizes)
     # TODO(burmako): Fix overly conservative type inference of DynamicGatherOp.
@@ -1845,7 +1847,7 @@ def _gather_lower(ctx, operand, indices, *,
         operand,
         indices,
         dnums,
-        mlir.dense_int_elements(slice_sizes),
+        mlir.dense_int_array(slice_sizes),
         indices_are_sorted=ir.BoolAttr.get(indices_are_sorted))]
 
 mlir.register_lowering(gather_p, _gather_lower)
@@ -1998,7 +2000,7 @@ def _scatter_add_jvp(primals, tangents, *, update_jaxpr, update_consts,
       indices_are_sorted=indices_are_sorted, unique_indices=unique_indices,
       mode=mode)
   if type(g_operand) is ad_util.Zero and type(g_updates) is ad_util.Zero:
-    tangent_out = ad_util.Zero.from_value(val_out)
+    tangent_out = ad_util.Zero.from_primal_value(val_out)
   else:
     g_operand = ad.instantiate_zeros(g_operand)
     g_updates = ad.instantiate_zeros(g_updates)
@@ -2150,7 +2152,7 @@ def _scatter_mul_jvp_rhs(g, x, i, y, *, dimension_numbers,
     raise NotImplementedError(
       "scatter_mul gradients are only implemented if `unique_indices=True`")
   return lax.mul(x, scatter_add(
-      lax.zeros_like_array(x), i, g, dimension_numbers=dimension_numbers,
+      ad_util.zeros_like_jaxval(x), i, g, dimension_numbers=dimension_numbers,
       indices_are_sorted=indices_are_sorted, unique_indices=unique_indices,
       mode=mode))
 
@@ -2178,7 +2180,7 @@ def _scatter_extremal_jvp(scatter_op, primals, tangents, update_jaxpr,
       unique_indices=unique_indices, mode=mode)
 
   if type(g_operand) is ad_util.Zero and type(g_updates) is ad_util.Zero:
-    tangent_out = ad_util.Zero.from_value(val_out)
+    tangent_out = ad_util.Zero.from_primal_value(val_out)
   else:
     g_operand = ad.instantiate_zeros(g_operand)
     g_updates = ad.instantiate_zeros(g_updates)
@@ -2292,7 +2294,7 @@ def _scatter_jvp(primals, tangents, *, update_jaxpr, update_consts,
       update_consts=update_consts, dimension_numbers=dnums,
       indices_are_sorted=indices_are_sorted, unique_indices=unique_indices,
       mode=mode)
-    return val_out, ad_util.Zero.from_value(val_out)
+    return val_out, ad_util.Zero.from_primal_value(val_out)
 
   g_operand = ad.instantiate_zeros(g_operand)
   g_updates = ad.instantiate_zeros(g_updates)
@@ -2382,7 +2384,7 @@ def _scatter_transpose_rule(t, operand, indices, updates, *,
                             update_jaxpr, update_consts, dimension_numbers,
                             indices_are_sorted, unique_indices, mode):
   if not unique_indices:
-    raise NotImplementedError("scatter transpose is only implemented where"
+    raise NotImplementedError("scatter transpose is only implemented where "
                               "unique_indices=True")
   assert not ad.is_undefined_primal(indices)
   if ad.is_undefined_primal(updates):
@@ -2434,7 +2436,7 @@ def _scatter_lower_opaque(ctx, operand, indices, updates, *,
                           unique_indices, indices_are_sorted, mode):
   aval_x, aval_indices, aval_updates = ctx.avals_in
   aval_y, = ctx.avals_out
-  elt_shape = aval_x.dtype._rules.physical_element_aval(aval_x.dtype).shape
+  elt_shape = core.physical_element_aval(aval_x.dtype).shape
   trailing_window_dims = [aval_updates.ndim + i for i in range(len(elt_shape))]
   dimension_numbers = dimension_numbers._replace(
       update_window_dims=(*dimension_numbers.update_window_dims,
@@ -2470,20 +2472,23 @@ def _scatter_lower(ctx, operand, indices, updates, *,
 
   if mode == GatherScatterMode.CLIP:
     clip_fn = mlir.lower_fun(_clamp_scatter_indices, multiple_results=False)
-    (indices,), = clip_fn(ctx.replace(avals_out=None), operand, indices,
+    (indices,) = clip_fn(ctx.replace(avals_out=None), operand, indices,
                           updates, dnums=dimension_numbers)
 
   dnums = dimension_numbers
   scatter_dnums = hlo.ScatterDimensionNumbers.get(
-    update_window_dims=list(dnums.update_window_dims),
-    inserted_window_dims=list(dnums.inserted_window_dims),
-    scattered_dims_to_operand_dims=list(dnums.scatter_dims_to_operand_dims),
-    index_vector_dim=len(ctx.avals_in[1].shape) - 1)
-  result = mlir.aval_to_ir_types(aval_out)
+      update_window_dims=list(dnums.update_window_dims),
+      inserted_window_dims=list(dnums.inserted_window_dims),
+      input_batching_dims=[],
+      scatter_indices_batching_dims=[],
+      scattered_dims_to_operand_dims=list(dnums.scatter_dims_to_operand_dims),
+      index_vector_dim=len(ctx.avals_in[1].shape) - 1,
+  )
+  result = mlir.aval_to_ir_type(aval_out)
   operand = [operand]
   updates = [updates]
   op = hlo.ScatterOp(
-      result,
+      (result,),
       operand,
       indices,
       updates,
@@ -2493,15 +2498,14 @@ def _scatter_lower(ctx, operand, indices, updates, *,
   scalar_type = mlir.aval_to_ir_type(core.ShapedArray((), aval_out.dtype))
   update = op.update_computation.blocks.append(scalar_type, scalar_type)
   with ir.InsertionPoint(update):
-    update_ctx = ctx.module_context.replace(
-        name_stack=source_info_util.new_name_stack())
+    name_stack = source_info_util.new_name_stack()
     if update_jaxpr.effects:
       raise NotImplementedError('Cannot lower effectful `scatter`.')
     out_nodes, _ = mlir.jaxpr_subcomp(
-        update_ctx, update_jaxpr, mlir.TokenSet(), update_consts,
-        (update.arguments[0],), (update.arguments[1],),
+        ctx.module_context, update_jaxpr, name_stack, mlir.TokenSet(),
+        update_consts, update.arguments[0], update.arguments[1],
         dim_var_values=ctx.dim_var_values)
-    hlo.return_(util.flatten(out_nodes))
+    hlo.return_(mlir.flatten_ir_values(out_nodes))
   return op.results
 
 mlir.register_lowering(scatter_p, _scatter_lower)
@@ -2527,18 +2531,21 @@ def _scatter_add_lower_gpu(ctx, operand, indices, updates,
 
   if mode == GatherScatterMode.CLIP:
     clip_fn = mlir.lower_fun(_clamp_scatter_indices, multiple_results=False)
-    (indices,), = clip_fn(ctx.replace(avals_out=None), operand, indices, updates,
-                          dnums=dimension_numbers)
+    indices, = clip_fn(ctx.replace(avals_out=None), operand, indices, updates,
+                       dnums=dimension_numbers)
 
   aval_out, = ctx.avals_out
   dnums = dimension_numbers
   scatter_dnums = hlo.ScatterDimensionNumbers.get(
-    update_window_dims=list(dnums.update_window_dims),
-    inserted_window_dims=list(dnums.inserted_window_dims),
-    scattered_dims_to_operand_dims=list(dnums.scatter_dims_to_operand_dims),
-    index_vector_dim=len(ctx.avals_in[1].shape) - 1)
+      update_window_dims=list(dnums.update_window_dims),
+      inserted_window_dims=list(dnums.inserted_window_dims),
+      input_batching_dims=[],
+      scatter_indices_batching_dims=[],
+      scattered_dims_to_operand_dims=list(dnums.scatter_dims_to_operand_dims),
+      index_vector_dim=len(ctx.avals_in[1].shape) - 1,
+  )
   real_dtype = _real_dtype(aval_out.dtype)
-  operand_type_part = mlir.aval_to_ir_types(
+  operand_type_part = mlir.aval_to_ir_type(
       core.ShapedArray(aval_out.shape, real_dtype))
 
   def _scatter(operand_part, updates_part):
@@ -2546,7 +2553,7 @@ def _scatter_add_lower_gpu(ctx, operand, indices, updates,
     updates_part = [updates_part]
 
     scatter = hlo.ScatterOp(
-        operand_type_part,
+        (operand_type_part,),
         operand_part,
         indices,
         updates_part,

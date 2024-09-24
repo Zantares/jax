@@ -17,7 +17,6 @@ import contextlib
 import unittest
 from absl.testing import absltest
 import jax
-from jax import config
 from jax._src import core
 from jax._src import test_util as jtu
 from jax._src.lib import xla_client as xc
@@ -31,7 +30,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 import numpy as np
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 prev_xla_flags = None
 
@@ -42,7 +41,7 @@ with contextlib.suppress(ImportError):
 
 class JaxAotTest(jtu.JaxTestCase):
 
-  @jtu.run_on_devices('tpu')
+  @jtu.run_on_devices('tpu', 'gpu')
   def test_pickle_pjit_lower(self):
     def fun(x):
       return x * x

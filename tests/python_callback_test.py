@@ -13,9 +13,9 @@
 # limitations under the License.
 
 import collections
+import contextlib
 import functools
 import logging
-import textwrap
 import time
 import unittest
 
@@ -26,13 +26,10 @@ from jax import lax
 from jax._src import config
 from jax._src import core
 from jax._src import dispatch
-from jax._src import maps
 from jax._src import test_util as jtu
 from jax._src import util
-from jax._src.lib import xla_client
 from jax.experimental import io_callback
 from jax.experimental import pjit
-from jax.experimental.maps import xmap
 from jax.experimental.shard_map import shard_map
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -40,22 +37,13 @@ import numpy as np
 
 config.parse_flags_with_absl()
 
-
-def _format_multiline(text):
-  return textwrap.dedent(text).lstrip()
-
-prev_xla_flags = None
-
+_exit_stack = contextlib.ExitStack()
 
 def setUpModule():
-  global prev_xla_flags
-  # This will control the CPU devices. On TPU we always have 2 devices
-  prev_xla_flags = jtu.set_host_platform_device_count(2)
+  _exit_stack.enter_context(jtu.set_host_platform_device_count(2))
 
-
-# Reset to previous configuration in case other test modules will be run.
 def tearDownModule():
-  prev_xla_flags()
+  _exit_stack.close()
 
 map, unsafe_map = util.safe_map, map
 
@@ -70,6 +58,7 @@ with_pure_and_io_callbacks = parameterized.named_parameters(
                      pure=jax.pure_callback)[flavor])
   for flavor in ("io_unordered", "io_ordered", "pure")
 )
+
 
 class PythonCallbackTest(jtu.JaxTestCase):
 
@@ -86,11 +75,77 @@ class PythonCallbackTest(jtu.JaxTestCase):
   def test_callback_with_scalar_values(self, *, callback):
     @jax.jit
     def f(x):
-      return callback(lambda x: x + np.float32(1.),
-                      core.ShapedArray(x.shape, x.dtype), x)
+      return callback(lambda x: x + 1.0, core.ShapedArray(x.shape, x.dtype), x)
 
     out = f(0.)
     self.assertEqual(out, 1.)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name=f"{flavor}_expect_dtype_{expect_dtype}",
+          callback=dict(
+              io_unordered=io_calback_unordered,
+              io_ordered=io_callback_ordered,
+              pure=jax.pure_callback,
+          )[flavor],
+          expect_dtype=expect_dtype,
+      )
+      for flavor in ("io_unordered", "io_ordered", "pure")
+      for expect_dtype in (np.int32, np.int64, np.float32, np.float64)
+  )
+  def test_callback_returning_python_literal(self, *, callback, expect_dtype):
+    returned_literal = 42 if expect_dtype in (np.int32, np.int64) else 42.0
+
+    @jax.jit
+    def f(x):
+      return callback(
+          lambda x: returned_literal, core.ShapedArray((), expect_dtype), x
+      )
+
+    if not config.enable_x64.value and expect_dtype in (np.int64, np.float64):
+      ctx = self.assertRaisesRegex(Exception, "result_shape_dtypes cannot specify 64-bit types")
+    elif config.enable_x64.value and expect_dtype in (np.int32, np.float32):
+      ctx = self.assertRaisesRegex(Exception, "Incorrect output dtype for return value")
+    else:
+      ctx = contextlib.nullcontext()
+
+    with ctx:
+      out = f(0.0)
+      jax.effects_barrier()
+      self.assertEqual(out, returned_literal)
+
+  @with_pure_and_io_callbacks
+  def test_callback_returning_custom_array(self, *, callback):
+    # Some users write the callback in TF, returning a tf.Tensor. We don't
+    # want to add TF as a dependency, but simulate that use case with a
+    # custom array class.
+    class CustomArray:
+
+      def __init__(self, a: np.ndarray):
+        self.a = a
+
+      @property
+      def shape(self):
+        return self.a.shape
+
+      @property
+      def dtype(self):
+        return self.a.dtype
+
+      def __array__(self):
+        return self.a
+
+    @jax.jit
+    def f(x):
+      return callback(
+          lambda x: CustomArray(np.array(42.0, dtype=np.float32)),
+          core.ShapedArray((), np.float32),
+          x,
+      )
+
+    out = f(0.0)
+    jax.effects_barrier()
+    self.assertEqual(out, 42.0)
 
   @parameterized.named_parameters(
     dict(testcase_name=f"{flavor}_{dtype}",
@@ -187,9 +242,14 @@ class PythonCallbackTest(jtu.JaxTestCase):
       # Calling a function expected a f32 return value but getting f64
       return callback(_cb, core.ShapedArray((1,), np.float32))
 
-    with self.assertRaises(RuntimeError):
-      f()
+    if config.enable_x64.value:
+      ctx = self.assertRaisesRegex(Exception, "Incorrect output dtype for return value")
+    else:
+      ctx = contextlib.nullcontext()
+    with ctx:
+      res = f()
       jax.effects_barrier()
+      self.assertAllClose(res, np.array([1], np.float32))
 
   @with_pure_and_io_callbacks
   def test_callback_with_wrongly_specified_64_bit_dtype(self, *, callback):
@@ -494,6 +554,43 @@ class PythonCallbackTest(jtu.JaxTestCase):
         out,
         np.arange(2 * jax.local_device_count()).reshape([-1, 2]) + 1.)
 
+  @with_pure_and_io_callbacks
+  def test_exception_in_callback(self, *, callback):
+    def fail(x):
+      raise RuntimeError("Ooops")
+
+    @jax.jit
+    def f(x):
+      return callback(fail, core.ShapedArray(x.shape, x.dtype), x)
+
+    with self.assertLogs(level="ERROR") as l:
+      try:
+        f(0.0).block_until_ready()
+      except RuntimeError:
+        pass
+
+      api_name = (
+          "pure_callback" if callback is jax.pure_callback else "io_callback"
+      )
+      output = "\n".join(l.output)
+      self.assertIn(f"jax.{api_name} failed", output)
+      self.assertIn("Traceback (most recent call last)", output)
+
+  @with_pure_and_io_callbacks
+  def test_compilation_caching(self, *, callback):
+    def f_outside(x):
+      return 2 * x
+
+    def fun(x):
+      return callback(f_outside, x, x)
+
+    x = np.arange(6, dtype=np.int32).reshape((2, 3))
+    with jtu.count_primitive_compiles() as count:
+      for _ in range(3):
+        self.assertAllClose(2 * x, fun(x))
+    self.assertEqual(count[0], 1)
+
+
 class PureCallbackTest(jtu.JaxTestCase):
 
   def setUp(self):
@@ -505,10 +602,10 @@ class PureCallbackTest(jtu.JaxTestCase):
     super().tearDown()
     dispatch.runtime_tokens.clear()
 
-  def test_pure_callback_passes_ndarrays_without_jit(self):
+  def test_pure_callback_passes_jax_arrays_without_jit(self):
 
     def cb(x):
-      self.assertIs(type(x), np.ndarray)
+      self.assertIsInstance(x, jax.Array)
       return x
 
     def f(x):
@@ -566,6 +663,16 @@ class PureCallbackTest(jtu.JaxTestCase):
     self.assertArraysAllClose(out, np.sin(np.arange(4.)) + np.arange(10., 14.),
                               rtol=1E-7, check_dtypes=False)
 
+    @jax.jit
+    @functools.partial(jax.vmap, in_axes=1, out_axes=1)
+    def h(x, y):
+      out_shape = jax.ShapeDtypeStruct(x.shape, np.result_type(x.dtype, y.dtype))
+      return jax.pure_callback(lambda x, y: np.sin(x) + y, out_shape, x, y)
+    out = h(jnp.arange(4.)[None], jnp.arange(10., 14.)[None])
+    self.assertArraysAllClose(out, np.sin(np.arange(4.)) + np.arange(10.,
+      14.)[None],
+                              rtol=1E-7, check_dtypes=False)
+
   def test_vmap_vectorized_callback(self):
 
     def cb(x):
@@ -598,6 +705,14 @@ class PureCallbackTest(jtu.JaxTestCase):
     out = h(jnp.arange(4.), 4.)
     np.testing.assert_allclose(out, np.sin(np.arange(4.)) + 4.)
 
+    @jax.jit
+    @functools.partial(jax.vmap, in_axes=(1, None), out_axes=1)
+    def h(x, y):
+      return jax.pure_callback(lambda x, y: np.sin(x) + y, x, x, y,
+                               vectorized=True)
+    out = h(jnp.arange(4.)[None], 4.)
+    np.testing.assert_allclose(out, np.sin(np.arange(4.)[None]) + 4.)
+
   def test_vmap_vectorized_callback_errors_if_returns_wrong_shape(self):
 
     def cb(x):
@@ -621,46 +736,6 @@ class PureCallbackTest(jtu.JaxTestCase):
     out = f(jnp.arange(float(jax.local_device_count())))
     np.testing.assert_allclose(out, np.sin(np.arange(jax.local_device_count())))
 
-  def test_can_pjit_pure_callback_under_hard_xmap(self):
-
-    if not hasattr(xla_client.OpSharding.Type, 'MANUAL'):
-      raise unittest.SkipTest('Manual partitioning needed for pure_callback')
-
-    spmd_lowering = maps.SPMD_LOWERING.value
-    spmd_manual_lowering = maps.SPMD_LOWERING_MANUAL.value
-    config.update('experimental_xmap_spmd_lowering', True)
-    config.update('experimental_xmap_spmd_lowering_manual', True)
-    try:
-      mesh = Mesh(np.array(jax.devices()), axis_names=('x',))
-
-      spec = jax.sharding.PartitionSpec('x')
-
-      def f(x):
-        axis_resources = {v: v for v in mesh.axis_names}
-        return xmap(
-            lambda x: jax.pure_callback(np.sin, x, x),
-            in_axes=(('x',),),
-            out_axes=('x',),
-            axis_resources=axis_resources,
-            axis_sizes=mesh.shape,
-        )(x)
-
-      def without_xmap_f(x):
-        return jax.pure_callback(np.sin, x, x)
-
-      with mesh:
-        inp = jnp.arange(float(jax.local_device_count()))
-        out = pjit.pjit(f, in_shardings=spec, out_shardings=spec)(inp)
-        np.testing.assert_allclose(
-            out, np.sin(np.arange(jax.local_device_count()))
-        )
-    finally:
-      config.update('experimental_xmap_spmd_lowering', spmd_lowering)
-      config.update(
-        'experimental_xmap_spmd_lowering_manual',
-        spmd_manual_lowering,
-      )
-
   def test_cant_take_grad_of_pure_callback(self):
 
     def sin(x):
@@ -673,6 +748,30 @@ class PureCallbackTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(
         ValueError, "Pure callbacks do not support JVP."):
       f(2.)
+
+  def test_error_propagation(self):
+    def throws_error_fn(x):
+      raise RuntimeError("Errors should propagate.")
+
+    @jax.jit
+    def f(x):
+      return jax.pure_callback(throws_error_fn, x, x)
+
+    with self.assertRaisesRegex(Exception, "Errors should propagate."):
+      print(np.array(f(2.0)), flush=True)
+
+  def test_reentrant_error_propagation(self):
+    reentrant_fn = jax.jit(jnp.sin).lower(2.0).compile()
+
+    @jax.jit
+    def f(x):
+      return jax.pure_callback(reentrant_fn, x, x)
+
+    try:
+      np.array(f(2.0))
+    except:
+      # Only should not deadlock.
+      pass
 
   def test_can_take_grad_of_pure_callback_with_custom_jvp(self):
 
@@ -791,35 +890,6 @@ class PureCallbackTest(jtu.JaxTestCase):
     # callback alive.
     np.testing.assert_allclose(out, np.full((num_devices, 4), 11, np.float32))
 
-
-  def test_callback_inside_xmap(self):
-
-    def _callback(x):
-      return (x + 1.).astype(x.dtype)
-
-    def f(x):
-      return jax.pure_callback(_callback, x, x)
-
-    f = maps.xmap(f, in_axes=['a'], out_axes=['a'],
-                  axis_resources={'a': 'dev'})
-    with jax.sharding.Mesh(np.array(jax.devices()), ['dev']):
-      out = f(np.arange(40.))
-    np.testing.assert_allclose(out, jnp.arange(1., 41.))
-
-  def test_vectorized_callback_inside_xmap(self):
-
-    def _callback(x):
-      return (x + 1.).astype(x.dtype)
-
-    def f(x):
-      return jax.pure_callback(_callback, x, x, vectorized=True)
-
-    f = maps.xmap(f, in_axes=['a'], out_axes=['a'],
-                  axis_resources={'a': 'dev'})
-    with jax.sharding.Mesh(np.array(jax.devices()), ['dev']):
-      out = f(np.arange(40.))
-    np.testing.assert_allclose(out, jnp.arange(1., 41.))
-
   def test_array_layout_is_preserved(self):
 
     def g(x):
@@ -899,6 +969,18 @@ class PureCallbackTest(jtu.JaxTestCase):
         out, inp + y
     )
 
+  def test_does_not_deadlock(self):
+    if jtu.device_under_test() == "tpu":
+      self.skipTest("The test raises an exception on TPU")
+
+    def f(x):
+      y = jnp.asarray(x) + 1
+      return np.asarray(2 * jnp.log(y))
+
+    x = jnp.array([1.0, 2.0, 3.0, 4.0])
+    out = jax.pure_callback(f, jax.ShapeDtypeStruct(x.shape, x.dtype), x)
+    np.testing.assert_allclose(out, 2 * jnp.log(x + 1))
+
 
 class IOCallbackTest(jtu.JaxTestCase):
 
@@ -951,14 +1033,6 @@ class IOCallbackTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(
         ValueError, "Ordered effects not supported in `pmap`"):
       jax.pmap(f)(jnp.arange(jax.local_device_count()))
-
-  def test_cannot_call_ordered_io_in_xmap(self):
-    def f(x):
-      return io_callback(
-          lambda x: x, jax.ShapeDtypeStruct((), jnp.int32), x, ordered=True)
-    with self.assertRaisesRegex(
-        ValueError, "Cannot `vmap` ordered IO callback"):
-      maps.xmap(f, in_axes=([0],), out_axes=[0])(jnp.arange(16))
 
   def test_cannot_call_ordered_io_in_vmap(self):
     def f(x):
@@ -1013,8 +1087,8 @@ class IOCallbackTest(jtu.JaxTestCase):
         io_callback(check, None, i)
         return i + 1
       return lax.while_loop(cond, body, i)
-    with self.assertRaisesRegex(NotImplementedError,
-        "IO effect not supported in vmap-of-while."):
+    with self.assertRaisesRegex(
+        Exception, "not supported in while_loop with batched predicate"):
       jax.vmap(f)(jnp.array([0, 4]))
 
   def test_cannot_use_io_callback_in_checkpoint(self):
@@ -1169,6 +1243,40 @@ class IOCallbackTest(jtu.JaxTestCase):
     for shard in _collected.values():
       self.assertLen(shard, 2)
       np.testing.assert_array_equal(shard[0] + 1, shard[1])
+
+  def test_batching_with_side_effects(self):
+    # https://github.com/jax-ml/jax/issues/20628#issuecomment-2050800195
+    x_lst = []
+    def append_x(x):
+      nonlocal x_lst
+      x_lst.append(x)
+
+    @jax.jit
+    def f(x):
+      io_callback(append_x, None, x, ordered=False)
+      io_callback(append_x, None, 2 * x, ordered=False)
+
+    jax.vmap(f)(jnp.arange(3.))
+    jax.effects_barrier()
+    self.assertAllClose(x_lst, [0., 1., 2., 0., 2., 4.], check_dtypes=False)
+
+  def test_batching_with_side_effects_while_loop(self):
+    # https://github.com/jax-ml/jax/issues/20628#issuecomment-2050921219
+    x_lst = []
+    def append_x(x):
+      nonlocal x_lst
+      x_lst.append(x)
+
+    @jax.jit
+    def f(x):
+      def body(i):
+        io_callback(append_x, None, x, ordered=False)
+        io_callback(append_x, None, 2 * x, ordered=False)
+        return i + 1
+      jax.lax.while_loop(lambda i: i < 2, body, 0)
+
+    jax.vmap(f)(jnp.arange(3.))  # don't crash
+    jax.effects_barrier()
 
 
 if __name__ == "__main__":

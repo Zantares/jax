@@ -4,9 +4,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <sstream>
+#include <string>
 #include <type_traits>
 
-#include "llvm/ADT/ArrayRef.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -15,6 +16,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "absl/types/span.h"
+#include "tsl/platform/statusor.h"
 
 // TODO: Instead of CHECK_EQs, can we do something like TF_RET_CHECK but with
 // MLIR diagnostics?
@@ -58,17 +60,19 @@ FailureOr<int8_t> getTypeBitwidth(Type ty) {
   if (auto bf16_ty = dyn_cast<BFloat16Type>(ty)) {
     return 16;
   }
+  if (auto f8e5m2_ty = dyn_cast<Float8E5M2Type>(ty)) {
+    return 8;
+  }
+  if (auto f8e4m3fn_ty = dyn_cast<Float8E4M3FNType>(ty)) {
+    return 8;
+  }
   return emitError(UnknownLoc::get(ty.getContext()), "Unsupported type: ")
          << ty;
 }
 
 template <typename T>
-llvm::ArrayRef<std::remove_const_t<T>> toArrayRef(absl::Span<T> span) {
-  return llvm::ArrayRef<std::remove_const_t<T>>(span.data(), span.size());
-}
-template <typename T, std::size_t N>
-llvm::ArrayRef<std::remove_const_t<T>> toArrayRef(std::array<T, N> array) {
-  return llvm::ArrayRef<std::remove_const_t<T>>(array.data(), array.size());
+ArrayRef<std::remove_const_t<T>> toArrayRef(absl::Span<T> span) {
+  return ArrayRef<std::remove_const_t<T>>(span.data(), span.size());
 }
 
 inline arith::ConstantOp IdxConst(int64_t idx, OpBuilder &builder,
@@ -77,6 +81,23 @@ inline arith::ConstantOp IdxConst(int64_t idx, OpBuilder &builder,
                                            builder.getIndexAttr(idx));
 }
 
+// Debug only util.
+template <typename T>
+std::string shapeToString(const T &shape) {
+  std::ostringstream os;
+  os << "(";
+  for (auto it = shape.begin(); it != shape.end(); ++it) {
+    if (it != shape.begin()) {
+      os << ",";
+    }
+    os << *it;
+  }
+  os << ")";
+  return os.str();
+}
+
+SmallVector<int64_t> ComputeTileStrides(MemRefType memref_ty,
+                                        absl::Span<const int64_t> tiling);
 }  // namespace mlir::tpu
 
 #endif  // THIRD_PARTY_PY_JAX_JAXLIB_MOSAIC_DIALECT_TPU_UTIL_H_

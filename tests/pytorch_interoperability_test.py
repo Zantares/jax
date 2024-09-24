@@ -88,8 +88,6 @@ class DLPackTest(jtu.JaxTestCase):
 
   @jtu.sample_product(shape=all_shapes, dtype=torch_dtypes)
   def testJaxArrayToTorch(self, shape, dtype):
-    if xla_bridge.using_pjrt_c_api():
-      self.skipTest("DLPack support is incomplete in the PJRT C API")
     if not config.enable_x64.value and dtype in [
         jnp.int64,
         jnp.float64,
@@ -111,9 +109,7 @@ class DLPackTest(jtu.JaxTestCase):
         self.assertAllClose(np, y.cpu().numpy())
 
   def testTorchToJaxInt64(self):
-    if xla_bridge.using_pjrt_c_api():
-      self.skipTest("DLPack support is incomplete in the PJRT C API")
-    # See https://github.com/google/jax/issues/11895
+    # See https://github.com/jax-ml/jax/issues/11895
     x = jax.dlpack.from_dlpack(
         torch.utils.dlpack.to_dlpack(torch.ones((2, 3), dtype=torch.int64)))
     dtype_expected = jnp.int64 if config.enable_x64.value else jnp.int32
@@ -121,8 +117,6 @@ class DLPackTest(jtu.JaxTestCase):
 
   @jtu.sample_product(shape=all_shapes, dtype=torch_dtypes)
   def testTorchToJax(self, shape, dtype):
-    if xla_bridge.using_pjrt_c_api():
-      self.skipTest("DLPack support is incomplete in the PJRT C API")
     if not config.enable_x64.value and dtype in [
         jnp.int64,
         jnp.float64,

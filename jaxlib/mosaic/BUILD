@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_library")
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
+load("@rules_python//python:defs.bzl", "py_library")
 
 licenses(["notice"])
 
 package(
     default_applicable_licenses = [],
     default_visibility = [
-        "//:__subpackages__",
+        "//jax:mosaic_users",
     ],
 )
 
@@ -28,7 +28,6 @@ py_library(
     name = "mosaic",
     deps = [
         "//jaxlib/mosaic/python:tpu_dialect",
-        "//jaxlib/mosaic/python:tpu_passes",
     ],
 )
 
@@ -41,23 +40,33 @@ cc_library(
         "dialect/tpu/layout.cc",
         "dialect/tpu/tpu_dialect.cc",
         "dialect/tpu/tpu_ops.cc",
-        "dialect/tpu/util.h",
+        "dialect/tpu/util.cc",
     ] + glob([
         "dialect/tpu/transforms/*.cc",
     ]),
     hdrs = [
         "dialect/tpu/layout.h",
         "dialect/tpu/tpu_dialect.h",
+        "dialect/tpu/util.h",
     ] + glob([
         "dialect/tpu/transforms/*.h",
     ]),
     # compatible with libtpu
     deps = [
         ":tpu_inc_gen",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/hash",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:ArithDialect",
         "@llvm-project//mlir:ControlFlowDialect",
         "@llvm-project//mlir:Dialect",
+        "@llvm-project//mlir:DialectUtils",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:LinalgTransforms",
@@ -66,17 +75,14 @@ cc_library(
         "@llvm-project//mlir:Pass",
         "@llvm-project//mlir:SCFDialect",
         "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
         "@llvm-project//mlir:TransformUtils",
         "@llvm-project//mlir:VectorDialect",
         "@llvm-project//mlir:VectorTransforms",
+        "@tsl//tsl/platform:statusor",
         "@xla//xla:array",
         "@xla//xla:shape_util",
         "@xla//xla:util",
-        "@com_google_absl//absl/hash",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -186,14 +192,14 @@ cc_library(
     deps = [
         ":tpu_dialect",
         ":tpu_inc_gen",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:CAPIIR",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",
         "@xla//xla:array",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
     ],
 )
 

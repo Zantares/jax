@@ -35,8 +35,7 @@ from jax._src.lax import windowed_reductions as lax_windowed_reductions
 from jax._src.lib import xla_client
 from jax._src.util import safe_map, safe_zip
 
-from jax import config
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -694,8 +693,8 @@ class LaxVmapTest(jtu.JaxTestCase):
   # TODO(b/183233858): variadic reduce-window is not implemented on XLA:GPU
   @jtu.skip_on_devices("gpu")
   def test_variadic_reduce_window(self):
-    # https://github.com/google/jax/discussions/9818 and
-    # https://github.com/google/jax/issues/9837
+    # https://github.com/jax-ml/jax/discussions/9818 and
+    # https://github.com/jax-ml/jax/issues/9837
     def normpool(x):
       norms = jnp.linalg.norm(x, axis=-1)
       idxs = jnp.arange(x.shape[0])

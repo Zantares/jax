@@ -17,13 +17,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import dataclasses
 import functools
 from functools import partial
 import itertools as it
-import operator
-from typing import Any, Callable, Protocol, Union
+from typing import Any, Protocol, Union
 
 import numpy as np
 
@@ -93,7 +92,7 @@ def sharding_to_proto(sharding: SpatialSharding):
   proto = xc.OpSharding()
   if isinstance(sharding, tuple) and not isinstance(sharding[0], int):
     assert all(s is None or isinstance(s, tuple) for s in sharding)
-    return tuple_sharding_proto(list(map(sharding_to_proto, sharding)))  # type: ignore
+    return tuple_sharding_proto(list(map(sharding_to_proto, sharding)))
 
   if sharding is None:
     proto.type = xc.OpSharding.Type.REPLICATED
@@ -109,8 +108,6 @@ def tuple_sharding_proto(elems):
   proto.type = xc.OpSharding.Type.TUPLE
   proto.tuple_shardings = elems
   return proto
-
-
 
 
 ### handlers
@@ -133,6 +130,10 @@ _xla_shape_handlers[core.AbstractToken] = lambda _: (xc.Shape.token_shape(),)
 
 # IR constants
 
+class InvalidInputException(Exception):
+  pass
+
+
 # TODO(mattjj): try to remove this canonicalize_dtype stuff
 def canonicalize_dtype(x):
   typ = type(x)
@@ -143,8 +144,8 @@ def canonicalize_dtype(x):
     if handler: return handler(x)
   if hasattr(x, '__jax_array__'):
     return canonicalize_dtype(x.__jax_array__())
-  raise TypeError(f"Argument '{x}' of type {type(x)} is not a valid "
-                  "JAX type.")
+  raise InvalidInputException(
+      f"Argument '{x}' of type {type(x)} is not a valid JAX type.")
 
 def _canonicalize_masked_array_dtype(x):
   raise ValueError("numpy masked arrays are not supported as direct inputs to JAX functions. "
@@ -166,6 +167,7 @@ canonicalize_dtype_handlers.update(
     (t, partial(_canonicalize_python_scalar_dtype, t)) for t in _scalar_types)
 canonicalize_dtype_handlers[core.Token] = identity
 canonicalize_dtype_handlers[core.DArray] = identity
+canonicalize_dtype_handlers[core.MutableArray] = identity
 
 def abstractify(x) -> Any:
   typ = type(x)
@@ -196,7 +198,8 @@ def _make_shaped_array_for_numpy_array(x: np.ndarray) -> ShapedArray:
 
 
 pytype_aval_mappings: dict[Any, Callable[[Any], core.AbstractValue]] = {}
-pytype_aval_mappings[core.DArray] = operator.attrgetter('_aval')
+pytype_aval_mappings[core.DArray] = lambda x: x._aval
+pytype_aval_mappings[core.MutableArray] = lambda x: x._aval
 pytype_aval_mappings[core.Token] = lambda _: core.abstract_token
 pytype_aval_mappings.update((t, _make_shaped_array_for_numpy_scalar)
                             for t in numpy_scalar_types)
